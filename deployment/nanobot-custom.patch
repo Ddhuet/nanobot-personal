@@ -1,0 +1,1727 @@
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/agent/context.py nanobot/agent/context.py
+--- nanobot/agent/context.py	2026-07-12 03:11:59.622296063 +0000
++++ nanobot/agent/context.py	2026-06-01 06:22:51.211074207 +0000
+@@ -6,7 +6,7 @@
+ from pathlib import Path
+ from typing import Any
+ 
+-from nanobot.utils.helpers import current_time_str
++from nanobot.utils.helpers import current_time_str, format_message_timestamp
+ 
+ from nanobot.agent.memory import MemoryStore
+ from nanobot.agent.skills import SkillsLoader
+@@ -143,12 +143,34 @@
+         else:
+             merged = [{"type": "text", "text": runtime_ctx}] + user_content
+ 
++        # Inject timestamps into user and assistant messages from history.
++        annotated_history = self._annotate_timestamps(history, self.timezone)
++
+         return [
+             {"role": "system", "content": self.build_system_prompt(skill_names)},
+-            *history,
++            *annotated_history,
+             {"role": current_role, "content": merged},
+         ]
+ 
++    @staticmethod
++    def _annotate_timestamps(history: list[dict[str, Any]], timezone: str | None = None) -> list[dict[str, Any]]:
++        """Prepend compact timestamps to user and assistant messages in history."""
++        result: list[dict[str, Any]] = []
++        for msg in history:
++            if msg.get("role") not in ("user", "assistant") or "timestamp" not in msg:
++                result.append(msg)
++                continue
++            ts_label = format_message_timestamp(msg["timestamp"], timezone)
++            content = msg.get("content", "")
++            new_msg = {k: v for k, v in msg.items() if k != "timestamp"}
++            if isinstance(content, str):
++                new_msg["content"] = f"{ts_label} {content}" if content else ts_label
++            else:
++                # Multimodal content list — prepend a text block
++                new_msg["content"] = [{"type": "text", "text": ts_label}, *content]
++            result.append(new_msg)
++        return result
++
+     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
+         """Build user message content with optional base64-encoded images."""
+         if not media:
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/agent/loop.py nanobot/agent/loop.py
+--- nanobot/agent/loop.py	2026-07-12 03:11:59.623296075 +0000
++++ nanobot/agent/loop.py	2026-06-14 12:29:12.699181321 +0000
+@@ -27,6 +27,7 @@
+ from nanobot.agent.tools.spawn import SpawnTool
+ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+ from nanobot.bus.events import InboundMessage, OutboundMessage
++from nanobot.utils.omega_log import aomega_log
+ from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+ from nanobot.bus.queue import MessageBus
+ from nanobot.providers.base import LLMProvider
+@@ -255,7 +256,8 @@
+                 loop_self._set_tool_context(channel, chat_id, message_id)
+ 
+             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
+-                return loop_self._strip_think(content)
++                from nanobot.utils.helpers import strip_leading_timestamp
++                return strip_leading_timestamp(loop_self._strip_think(content))
+ 
+         result = await self.runner.run(AgentRunSpec(
+             initial_messages=initial_messages,
+@@ -271,6 +273,13 @@
+             logger.warning("Max iterations ({}) reached", self.max_iterations)
+         elif result.stop_reason == "error":
+             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
++        await aomega_log("AGENT_LOOP_RESULT", {
++            "final_content": result.final_content,
++            "tools_used": result.tools_used,
++            "stop_reason": result.stop_reason,
++            "usage": result.usage,
++            "error": result.error,
++        })
+         return result.final_content, result.tools_used, result.messages
+ 
+     async def run(self) -> None:
+@@ -423,6 +432,14 @@
+ 
+         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
++        await aomega_log("INBOUND_MESSAGE", {
++            "channel": msg.channel,
++            "sender_id": msg.sender_id,
++            "chat_id": msg.chat_id,
++            "session_key": msg.session_key,
++            "content_preview": preview,
++            "metadata": msg.metadata,
++        })
+ 
+         key = session_key or msg.session_key
+         session = self.sessions.get_or_create(key)
+@@ -561,6 +578,10 @@
+                     if not filtered:
+                         continue
+                     entry["content"] = filtered
++            elif role == "assistant":
++                if isinstance(content, str):
++                    from nanobot.utils.helpers import strip_leading_timestamp
++                    entry["content"] = strip_leading_timestamp(content)
+             entry.setdefault("timestamp", datetime.now().isoformat())
+             session.messages.append(entry)
+         session.updated_at = datetime.now()
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/agent/runner.py nanobot/agent/runner.py
+--- nanobot/agent/runner.py	2026-07-12 03:11:59.624296086 +0000
++++ nanobot/agent/runner.py	2026-04-27 22:31:00.835761415 +0000
+@@ -66,6 +66,13 @@
+         tool_events: list[dict[str, str]] = []
+ 
+         for iteration in range(spec.max_iterations):
++            from nanobot.utils.omega_log import aomega_log
++            await aomega_log("AGENT_ITERATION", {
++                "iteration": iteration,
++                "messages": messages,
++                "tools": spec.tools.get_definitions(),
++                "model": spec.model,
++            })
+             context = AgentHookContext(iteration=iteration, messages=messages)
+             await hook.before_iteration(context)
+             kwargs: dict[str, Any] = {
+@@ -205,11 +212,24 @@
+         spec: AgentRunSpec,
+         tool_call: ToolCallRequest,
+     ) -> tuple[Any, dict[str, str], BaseException | None]:
++        from nanobot.utils.omega_log import aomega_log
++        await aomega_log("TOOL_EXECUTION", {
++            "tool_call_id": tool_call.id,
++            "tool": tool_call.name,
++            "arguments": tool_call.arguments,
++            "extra_content": tool_call.extra_content,
++            "provider_specific_fields": tool_call.provider_specific_fields,
++        })
+         try:
+             result = await spec.tools.execute(tool_call.name, tool_call.arguments)
+         except asyncio.CancelledError:
+             raise
+         except BaseException as exc:
++            await aomega_log("TOOL_EXECUTION_ERROR", {
++                "tool": tool_call.name,
++                "error": repr(exc),
++                "error_type": type(exc).__name__,
++            })
+             event = {
+                 "name": tool_call.name,
+                 "status": "error",
+@@ -225,6 +245,11 @@
+             detail = "(empty)"
+         elif len(detail) > 120:
+             detail = detail[:120] + "..."
++        await aomega_log("TOOL_EXECUTION_RESULT", {
++            "tool": tool_call.name,
++            "full_result": result,
++            "status": "error" if isinstance(result, str) and result.startswith("Error") else "ok",
++        })
+         return result, {
+             "name": tool_call.name,
+             "status": "error" if isinstance(result, str) and result.startswith("Error") else "ok",
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/agent/tools/message.py nanobot/agent/tools/message.py
+--- nanobot/agent/tools/message.py	2026-07-12 03:11:59.626296109 +0000
++++ nanobot/agent/tools/message.py	2026-06-14 12:28:56.109921251 +0000
+@@ -4,6 +4,7 @@
+ 
+ from nanobot.agent.tools.base import Tool
+ from nanobot.bus.events import OutboundMessage
++from nanobot.utils.helpers import strip_leading_timestamp
+ 
+ 
+ class MessageTool(Tool):
+@@ -94,6 +95,8 @@
+         if not self._send_callback:
+             return "Error: Message sending not configured"
+ 
++        content = strip_leading_timestamp(content) or ""
++
+         msg = OutboundMessage(
+             channel=channel,
+             chat_id=chat_id,
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/agent/tools/registry.py nanobot/agent/tools/registry.py
+--- nanobot/agent/tools/registry.py	2026-07-12 03:11:59.627296120 +0000
++++ nanobot/agent/tools/registry.py	2026-04-27 22:30:37.231435381 +0000
+@@ -37,6 +37,7 @@
+ 
+     async def execute(self, name: str, params: dict[str, Any]) -> Any:
+         """Execute a tool by name with given parameters."""
++        from nanobot.utils.omega_log import aomega_log
+         _HINT = "\n\n[Analyze the error above and try a different approach.]"
+ 
+         tool = self._tools.get(name)
+@@ -46,16 +47,34 @@
+         try:
+             # Attempt to cast parameters to match schema types
+             params = tool.cast_params(params)
+-            
++
++            await aomega_log("TOOL_CALL", {
++                "tool": name,
++                "params": params,
++            })
++
+             # Validate parameters
+             errors = tool.validate_params(params)
+             if errors:
++                await aomega_log("TOOL_ERROR", {
++                    "tool": name,
++                    "validation_errors": errors,
++                })
+                 return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
+             result = await tool.execute(**params)
++            await aomega_log("TOOL_RESULT", {
++                "tool": name,
++                "result": result,
++            })
+             if isinstance(result, str) and result.startswith("Error"):
+                 return result + _HINT
+             return result
+         except Exception as e:
++            await aomega_log("TOOL_ERROR", {
++                "tool": name,
++                "error": repr(e),
++                "error_type": type(e).__name__,
++            })
+             return f"Error executing {name}: {str(e)}" + _HINT
+ 
+     @property
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/agent/tools/web.py nanobot/agent/tools/web.py
+--- nanobot/agent/tools/web.py	2026-07-12 03:11:59.628296132 +0000
++++ nanobot/agent/tools/web.py	2026-04-27 22:30:23.047239300 +0000
+@@ -93,8 +93,15 @@
+         self.proxy = proxy
+ 
+     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
++        from nanobot.utils.omega_log import aomega_log
+         provider = self.config.provider.strip().lower() or "brave"
+         n = min(max(count or self.config.max_results, 1), 10)
++        await aomega_log("WEB_SEARCH_CONFIG", {
++            "provider": provider,
++            "query": query,
++            "count": n,
++            "proxy": self.proxy,
++        })
+ 
+         if provider == "duckduckgo":
+             return await self._search_duckduckgo(query, n)
+@@ -110,18 +117,30 @@
+             return f"Error: unknown search provider '{provider}'"
+ 
+     async def _search_brave(self, query: str, n: int) -> str:
++        from nanobot.utils.omega_log import aomega_log
+         api_key = self.config.api_key or os.environ.get("BRAVE_API_KEY", "")
+         if not api_key:
+             logger.warning("BRAVE_API_KEY not set, falling back to DuckDuckGo")
+             return await self._search_duckduckgo(query, n)
+         try:
+             async with httpx.AsyncClient(proxy=self.proxy) as client:
+-                r = await client.get(
+-                    "https://api.search.brave.com/res/v1/web/search",
+-                    params={"q": query, "count": n},
+-                    headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+-                    timeout=10.0,
+-                )
++                url = "https://api.search.brave.com/res/v1/web/search"
++                headers = {"Accept": "application/json", "X-Subscription-Token": api_key}
++                params = {"q": query, "count": n}
++                await aomega_log("WEB_SEARCH_REQUEST", {
++                    "provider": "brave",
++                    "method": "GET",
++                    "url": url,
++                    "headers": headers,
++                    "params": params,
++                })
++                r = await client.get(url, params=params, headers=headers, timeout=10.0)
++                await aomega_log("WEB_SEARCH_RESPONSE", {
++                    "provider": "brave",
++                    "status_code": r.status_code,
++                    "response_headers": dict(r.headers),
++                    "response_body": r.text,
++                })
+                 r.raise_for_status()
+             items = [
+                 {"title": x.get("title", ""), "url": x.get("url", ""), "content": x.get("description", "")}
+@@ -129,27 +148,42 @@
+             ]
+             return _format_results(query, items, n)
+         except Exception as e:
++            await aomega_log("WEB_SEARCH_ERROR", {"provider": "brave", "error": repr(e)})
+             return f"Error: {e}"
+ 
+     async def _search_tavily(self, query: str, n: int) -> str:
++        from nanobot.utils.omega_log import aomega_log
+         api_key = self.config.api_key or os.environ.get("TAVILY_API_KEY", "")
+         if not api_key:
+             logger.warning("TAVILY_API_KEY not set, falling back to DuckDuckGo")
+             return await self._search_duckduckgo(query, n)
+         try:
+             async with httpx.AsyncClient(proxy=self.proxy) as client:
+-                r = await client.post(
+-                    "https://api.tavily.com/search",
+-                    headers={"Authorization": f"Bearer {api_key}"},
+-                    json={"query": query, "max_results": n},
+-                    timeout=15.0,
+-                )
++                url = "https://api.tavily.com/search"
++                headers = {"Authorization": f"Bearer {api_key}"}
++                body = {"query": query, "max_results": n}
++                await aomega_log("WEB_SEARCH_REQUEST", {
++                    "provider": "tavily",
++                    "method": "POST",
++                    "url": url,
++                    "headers": headers,
++                    "body": body,
++                })
++                r = await client.post(url, headers=headers, json=body, timeout=15.0)
++                await aomega_log("WEB_SEARCH_RESPONSE", {
++                    "provider": "tavily",
++                    "status_code": r.status_code,
++                    "response_headers": dict(r.headers),
++                    "response_body": r.text,
++                })
+                 r.raise_for_status()
+             return _format_results(query, r.json().get("results", []), n)
+         except Exception as e:
++            await aomega_log("WEB_SEARCH_ERROR", {"provider": "tavily", "error": repr(e)})
+             return f"Error: {e}"
+ 
+     async def _search_searxng(self, query: str, n: int) -> str:
++        from nanobot.utils.omega_log import aomega_log
+         base_url = (self.config.base_url or os.environ.get("SEARXNG_BASE_URL", "")).strip()
+         if not base_url:
+             logger.warning("SEARXNG_BASE_URL not set, falling back to DuckDuckGo")
+@@ -160,18 +194,30 @@
+             return f"Error: invalid SearXNG URL: {error_msg}"
+         try:
+             async with httpx.AsyncClient(proxy=self.proxy) as client:
+-                r = await client.get(
+-                    endpoint,
+-                    params={"q": query, "format": "json"},
+-                    headers={"User-Agent": USER_AGENT},
+-                    timeout=10.0,
+-                )
++                headers = {"User-Agent": USER_AGENT}
++                params = {"q": query, "format": "json"}
++                await aomega_log("WEB_SEARCH_REQUEST", {
++                    "provider": "searxng",
++                    "method": "GET",
++                    "url": endpoint,
++                    "headers": headers,
++                    "params": params,
++                })
++                r = await client.get(endpoint, params=params, headers=headers, timeout=10.0)
++                await aomega_log("WEB_SEARCH_RESPONSE", {
++                    "provider": "searxng",
++                    "status_code": r.status_code,
++                    "response_headers": dict(r.headers),
++                    "response_body": r.text,
++                })
+                 r.raise_for_status()
+             return _format_results(query, r.json().get("results", []), n)
+         except Exception as e:
++            await aomega_log("WEB_SEARCH_ERROR", {"provider": "searxng", "error": repr(e)})
+             return f"Error: {e}"
+ 
+     async def _search_jina(self, query: str, n: int) -> str:
++        from nanobot.utils.omega_log import aomega_log
+         api_key = self.config.api_key or os.environ.get("JINA_API_KEY", "")
+         if not api_key:
+             logger.warning("JINA_API_KEY not set, falling back to DuckDuckGo")
+@@ -179,12 +225,22 @@
+         try:
+             headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
+             async with httpx.AsyncClient(proxy=self.proxy) as client:
+-                r = await client.get(
+-                    f"https://s.jina.ai/",
+-                    params={"q": query},
+-                    headers=headers,
+-                    timeout=15.0,
+-                )
++                url = "https://s.jina.ai/"
++                params = {"q": query}
++                await aomega_log("WEB_SEARCH_REQUEST", {
++                    "provider": "jina",
++                    "method": "GET",
++                    "url": url,
++                    "headers": headers,
++                    "params": params,
++                })
++                r = await client.get(url, params=params, headers=headers, timeout=15.0)
++                await aomega_log("WEB_SEARCH_RESPONSE", {
++                    "provider": "jina",
++                    "status_code": r.status_code,
++                    "response_headers": dict(r.headers),
++                    "response_body": r.text,
++                })
+                 r.raise_for_status()
+             data = r.json().get("data", [])[:n]
+             items = [
+@@ -193,16 +249,27 @@
+             ]
+             return _format_results(query, items, n)
+         except Exception as e:
++            await aomega_log("WEB_SEARCH_ERROR", {"provider": "jina", "error": repr(e)})
+             return f"Error: {e}"
+ 
+     async def _search_duckduckgo(self, query: str, n: int) -> str:
++        from nanobot.utils.omega_log import aomega_log
+         try:
+             # Note: duckduckgo_search is synchronous and does its own requests
+             # We run it in a thread to avoid blocking the loop
+             from ddgs import DDGS
+ 
+             ddgs = DDGS(timeout=10)
++            await aomega_log("WEB_SEARCH_REQUEST", {
++                "provider": "duckduckgo",
++                "query": query,
++                "max_results": n,
++            })
+             raw = await asyncio.to_thread(ddgs.text, query, max_results=n)
++            await aomega_log("WEB_SEARCH_RESPONSE", {
++                "provider": "duckduckgo",
++                "raw_results": raw,
++            })
+             if not raw:
+                 return f"No results for: {query}"
+             items = [
+@@ -211,6 +278,7 @@
+             ]
+             return _format_results(query, items, n)
+         except Exception as e:
++            await aomega_log("WEB_SEARCH_ERROR", {"provider": "duckduckgo", "error": repr(e)})
+             logger.warning("DuckDuckGo search failed: {}", e)
+             return f"Error: DuckDuckGo search failed ({e})"
+ 
+@@ -235,8 +303,17 @@
+         self.proxy = proxy
+ 
+     async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> Any:
++        from nanobot.utils.omega_log import aomega_log
+         max_chars = maxChars or self.max_chars
+         is_valid, error_msg = _validate_url_safe(url)
++        await aomega_log("WEB_FETCH_CONFIG", {
++            "url": url,
++            "extract_mode": extractMode,
++            "max_chars": max_chars,
++            "validation_ok": is_valid,
++            "validation_error": error_msg,
++            "proxy": self.proxy,
++        })
+         if not is_valid:
+             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
+ 
+@@ -256,7 +333,7 @@
+                         raw = await r.aread()
+                         return build_image_content_blocks(raw, ctype, url, f"(Image fetched from: {url})")
+         except Exception as e:
+-            logger.debug("Pre-fetch image detection failed for {}: {}", url, e)
++            logger.debug("Pre-fetch image detection failed for {}, falling back: {}", url, e)
+ 
+         result = await self._fetch_jina(url, max_chars)
+         if result is None:
+@@ -265,13 +342,27 @@
+ 
+     async def _fetch_jina(self, url: str, max_chars: int) -> str | None:
+         """Try fetching via Jina Reader API. Returns None on failure."""
++        from nanobot.utils.omega_log import aomega_log
+         try:
+             headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+             jina_key = os.environ.get("JINA_API_KEY", "")
+             if jina_key:
+                 headers["Authorization"] = f"Bearer {jina_key}"
+             async with httpx.AsyncClient(proxy=self.proxy, timeout=20.0) as client:
+-                r = await client.get(f"https://r.jina.ai/{url}", headers=headers)
++                request_url = f"https://r.jina.ai/{url}"
++                await aomega_log("WEB_FETCH_REQUEST", {
++                    "provider": "jina",
++                    "method": "GET",
++                    "url": request_url,
++                    "headers": headers,
++                })
++                r = await client.get(request_url, headers=headers)
++                await aomega_log("WEB_FETCH_RESPONSE", {
++                    "provider": "jina",
++                    "status_code": r.status_code,
++                    "response_headers": dict(r.headers),
++                    "response_body": r.text,
++                })
+                 if r.status_code == 429:
+                     logger.debug("Jina Reader rate limited, falling back to readability")
+                     return None
+@@ -296,11 +387,13 @@
+                 "untrusted": True, "text": text,
+             }, ensure_ascii=False)
+         except Exception as e:
++            await aomega_log("WEB_FETCH_ERROR", {"provider": "jina", "error": repr(e)})
+             logger.debug("Jina Reader failed for {}, falling back to readability: {}", url, e)
+             return None
+ 
+     async def _fetch_readability(self, url: str, extract_mode: str, max_chars: int) -> Any:
+         """Local fallback using readability-lxml."""
++        from nanobot.utils.omega_log import aomega_log
+         from readability import Document
+ 
+         try:
+@@ -310,7 +403,19 @@
+                 timeout=30.0,
+                 proxy=self.proxy,
+             ) as client:
++                await aomega_log("WEB_FETCH_REQUEST", {
++                    "provider": "readability",
++                    "method": "GET",
++                    "url": url,
++                    "headers": {"User-Agent": USER_AGENT},
++                })
+                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
++                await aomega_log("WEB_FETCH_RESPONSE", {
++                    "provider": "readability",
++                    "status_code": r.status_code,
++                    "response_headers": dict(r.headers),
++                    "response_body": r.text,
++                })
+                 r.raise_for_status()
+ 
+             from nanobot.security.network import validate_resolved_url
+@@ -343,9 +448,11 @@
+                 "untrusted": True, "text": text,
+             }, ensure_ascii=False)
+         except httpx.ProxyError as e:
++            await aomega_log("WEB_FETCH_ERROR", {"provider": "readability", "error": repr(e)})
+             logger.error("WebFetch proxy error for {}: {}", url, e)
+             return json.dumps({"error": f"Proxy error: {e}", "url": url}, ensure_ascii=False)
+         except Exception as e:
++            await aomega_log("WEB_FETCH_ERROR", {"provider": "readability", "error": repr(e)})
+             logger.error("WebFetch error for {}: {}", url, e)
+             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/cli/commands.py nanobot/cli/commands.py
+--- nanobot/cli/commands.py	2026-07-12 03:11:59.639296257 +0000
++++ nanobot/cli/commands.py	2026-06-14 12:29:30.182454764 +0000
+@@ -375,17 +375,19 @@
+         json.dump(data, f, indent=2, ensure_ascii=False)
+ 
+ 
+-def _make_provider(config: Config):
++def _make_provider(config: Config, model_override: str | None = None, provider_override: str | None = None):
+     """Create the appropriate LLM provider from config.
+ 
+     Routing is driven by ``ProviderSpec.backend`` in the registry.
++    When *model_override* / *provider_override* are given they replace the
++    defaults from ``agents.defaults`` — used for heartbeat phase 1.
+     """
+     from nanobot.providers.base import GenerationSettings
+     from nanobot.providers.registry import find_by_name
+ 
+-    model = config.agents.defaults.model
+-    provider_name = config.get_provider_name(model)
+-    p = config.get_provider(model)
++    model = model_override or config.agents.defaults.model
++    provider_name = config.get_provider_name(model, forced_provider=provider_override)
++    p = config.get_provider(model, forced_provider=provider_override)
+     spec = find_by_name(provider_name) if provider_name else None
+     backend = spec.backend if spec else "openai_compat"
+ 
+@@ -419,7 +421,7 @@
+         from nanobot.providers.anthropic_provider import AnthropicProvider
+         provider = AnthropicProvider(
+             api_key=p.api_key if p else None,
+-            api_base=config.get_api_base(model),
++            api_base=config.get_api_base(model, forced_provider=provider_override),
+             default_model=model,
+             extra_headers=p.extra_headers if p else None,
+         )
+@@ -427,7 +429,7 @@
+         from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+         provider = OpenAICompatProvider(
+             api_key=p.api_key if p else None,
+-            api_base=config.get_api_base(model),
++            api_base=config.get_api_base(model, forced_provider=provider_override),
+             default_model=model,
+             extra_headers=p.extra_headers if p else None,
+             spec=spec,
+@@ -511,12 +513,15 @@
+     from nanobot.cron.types import CronJob
+     from nanobot.heartbeat.service import HeartbeatService
+     from nanobot.session.manager import SessionManager
++    from loguru import logger
+ 
+     if verbose:
+         import logging
+         logging.basicConfig(level=logging.DEBUG)
+ 
+     config = _load_runtime_config(config, workspace)
++    from nanobot.utils.omega_log import init_omega_logging
++    init_omega_logging(config.omega_logging)
+     port = port if port is not None else config.gateway.port
+ 
+     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+@@ -603,61 +608,188 @@
+     # Create channel manager
+     channels = ChannelManager(config, bus)
+ 
+-    def _pick_heartbeat_target() -> tuple[str, str]:
+-        """Pick a routable channel/chat target for heartbeat-triggered messages."""
++    _INTERNAL_CHANNELS = {"cli", "system", "cron", "heartbeat"}
++
++    def _pick_heartbeat_target() -> tuple[str, str, str | None]:
++        """Pick a routable channel/chat target for heartbeat-triggered messages.
++
++        Returns (channel, chat_id, session_key) where session_key is the
++        chat session key used to mirror the conversation history into the
++        heartbeat session.  session_key is None when no active chat exists.
++
++        Checks the in-memory session cache first (always current) then
++        falls back to on-disk sessions for anything not cached.
++        """
+         enabled = set(channels.enabled_channels)
+-        # Prefer the most recently updated non-internal session on an enabled channel.
++        candidates: dict[str, str] = {}  # key -> updated_at (iso)
++
++        # In-memory cache entries are always fresher than disk.
++        for key, sess in agent.sessions._cache.items():
++            if key in _INTERNAL_CHANNELS or ":" not in key:
++                continue
++            ch, cid = key.split(":", 1)
++            if ch in _INTERNAL_CHANNELS or ch not in enabled or not cid:
++                continue
++            candidates[key] = sess.updated_at.isoformat() if sess.updated_at else ""
++
++        # Merge on-disk sessions that aren't already in the cache.
+         for item in session_manager.list_sessions():
+             key = item.get("key") or ""
+-            if ":" not in key:
++            if key in candidates or ":" not in key:
+                 continue
+-            channel, chat_id = key.split(":", 1)
+-            if channel in {"cli", "system"}:
++            ch, cid = key.split(":", 1)
++            if ch not in enabled or not cid:
+                 continue
+-            if channel in enabled and chat_id:
+-                return channel, chat_id
+-        # Fallback keeps prior behavior but remains explicit.
+-        return "cli", "direct"
++            candidates[key] = item.get("updated_at", "")
++
++        if not candidates:
++            logger.debug("Heartbeat: no active chat session found")
++            return "cli", "direct", None
++
++        # Pick the most recently updated candidate.
++        best_key = max(candidates, key=lambda k: candidates[k])
++        ch, cid = best_key.split(":", 1)
++        logger.debug("Heartbeat: picked target {} -> {}:{}",
++                      best_key, ch, cid)
++        return ch, cid, best_key
++
++    def _get_chat_history() -> tuple[list[dict[str, Any]], str | None, str | None]:
++        """Return (chat_history, session_key, last_user_timestamp) from the most recent active chat session."""
++        _, _, chat_session_key = _pick_heartbeat_target()
++        if not chat_session_key:
++            return [], None, None
++        session = agent.sessions.get_or_create(chat_session_key)
++        history = session.get_history(max_messages=0)
++        last_user_ts: str | None = None
++        for msg in reversed(session.messages):
++            if msg.get("role") == "user" and msg.get("timestamp"):
++                last_user_ts = msg["timestamp"]
++                break
++        logger.debug("Heartbeat: history for {} has {} messages, last_user_ts={}",
++                      chat_session_key, len(history), last_user_ts)
++        return history, chat_session_key, last_user_ts
+ 
+     # Create heartbeat service
++    hb_cfg = config.gateway.heartbeat
++    hb_decide_model = hb_cfg.model or config.agents.defaults.model
++    if hb_cfg.model is not None or hb_cfg.provider is not None:
++        hb_decide_provider = _make_provider(config, model_override=hb_decide_model, provider_override=hb_cfg.provider)
++    else:
++        hb_decide_provider = provider
++
++    def _build_heartbeat_task_message(tasks: str, chat_session_key: str | None, timezone: str | None) -> str:
++        from datetime import datetime
++
++        from nanobot.utils.helpers import current_time_str, format_datetime
++
++        parts: list[str] = []
++        parts.append(f"Current Time: {current_time_str(timezone)}")
++
++        if chat_session_key:
++            chat_session = agent.sessions.get_or_create(chat_session_key)
++            for msg in reversed(chat_session.messages):
++                if msg.get("role") == "user" and msg.get("timestamp"):
++                    try:
++                        last_dt = datetime.fromisoformat(msg["timestamp"])
++                        parts.append(f"Time of last message from user: {format_datetime(last_dt, timezone)}")
++                    except (ValueError, TypeError):
++                        pass
++                    break
++
++        parts.append(
++            "The recurring heartbeat agent has suggested that you might want to perform a task from HEARTBEAT.md, and has sent you the message:\n\n"
++            f"```\n{tasks}\n```\n\n"
++            "Take the conversation history, the MEMORY.md contents, and the HEARTBEAT.md content into account (you'll need to manually read HEARTBEAT.md for now), and perform "
++            "the task if it matches what is requested in HEARTBEAT.md. If you need to send the user a message, you MUST "
++            "use the 'message' tool as they will not see your regular outputs. If you do not think it is necesary to perform the task at the moment, simply respond (as a regular output, not with the message tool) with a very brief description of why so it can be logged. Remember, if you need to send the user a message as part of a HEARTBEAT.md task, it is *required* that you use the 'message' tool, your regular response text is ONLY logged."
++        )
++        return "\n\n".join(parts)
++
+     async def on_heartbeat_execute(tasks: str) -> str:
+         """Phase 2: execute heartbeat tasks through the full agent loop."""
+-        channel, chat_id = _pick_heartbeat_target()
++        import json as _json
++
++        channel, chat_id, chat_session_key = _pick_heartbeat_target()
++        logger.info("Heartbeat phase 2: channel={} chat_id={} session={}",
++                     channel, chat_id, chat_session_key)
++
++        # Clear heartbeat session completely for a fresh start.
++        hb_session = agent.sessions.get_or_create("heartbeat")
++        hb_session.clear()
++
++        # Seed heartbeat session with a copy of the chat session history
++        # so the agent has full conversation context while executing the task.
++        if chat_session_key:
++            chat_session = agent.sessions.get_or_create(chat_session_key)
++            hb_session.messages = [dict(msg) for msg in chat_session.messages]
++            hb_session.last_consolidated = chat_session.last_consolidated
++            logger.debug("Heartbeat phase 2: seeded {} messages from {}",
++                          len(hb_session.messages), chat_session_key)
++
++        agent.sessions.save(hb_session)
++        initial_count = len(hb_session.messages)
++
++        task_message = _build_heartbeat_task_message(tasks, chat_session_key, config.agents.defaults.timezone)
+ 
+         async def _silent(*_args, **_kwargs):
+             pass
+ 
+         resp = await agent.process_direct(
+-            tasks,
++            task_message,
+             session_key="heartbeat",
+             channel=channel,
+             chat_id=chat_id,
+             on_progress=_silent,
+         )
+ 
+-        # Keep a small tail of heartbeat history so the loop stays bounded
+-        # without losing all short-term context between runs.
+-        session = agent.sessions.get_or_create("heartbeat")
+-        session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
+-        agent.sessions.save(session)
+-
+-        return resp.content if resp else ""
++        # Mirror 'message' tool-call content into the regular chat session
++        # so the conversation context stays current.  (The message tool already
++        # delivers the content to the user's channel via the bus during
++        # execution, so no separate notify step is needed.)
++        if chat_session_key:
++            hb_session = agent.sessions.get_or_create("heartbeat")
++            chat_session = agent.sessions.get_or_create(chat_session_key)
++            for msg in hb_session.messages[initial_count:]:
++                if msg.get("role") == "assistant" and msg.get("tool_calls"):
++                    for tc in msg["tool_calls"]:
++                        func = tc.get("function", {})
++                        if func.get("name") == "message":
++                            args = func.get("arguments", {})
++                            if isinstance(args, str):
++                                try:
++                                    args = _json.loads(args)
++                                except (_json.JSONDecodeError, TypeError):
++                                    continue
++                            content = args.get("content", "")
++                            if content:
++                                from nanobot.utils.helpers import strip_leading_timestamp
++                                content = strip_leading_timestamp(content)
++                                if content:
++                                    chat_session.add_message("assistant", content)
++            agent.sessions.save(chat_session)
++
++        # Return empty string so the model's plain-text response is never
++        # forwarded to the user's channel.  Only explicit 'message' tool
++        # calls reach the user (via the bus during execution above).
++        return ""
+ 
+     async def on_heartbeat_notify(response: str) -> None:
+         """Deliver a heartbeat response to the user's channel."""
+         from nanobot.bus.events import OutboundMessage
+-        channel, chat_id = _pick_heartbeat_target()
++        channel, chat_id, _ = _pick_heartbeat_target()
+         if channel == "cli":
+             return  # No external channel available to deliver to
+         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
+ 
+-    hb_cfg = config.gateway.heartbeat
+     heartbeat = HeartbeatService(
+         workspace=config.workspace_path,
+         provider=provider,
+         model=agent.model,
++        decide_provider=hb_decide_provider,
++        decide_model=hb_decide_model,
+         on_execute=on_heartbeat_execute,
+         on_notify=on_heartbeat_notify,
++        get_chat_history=_get_chat_history,
+         interval_s=hb_cfg.interval_s,
+         enabled=hb_cfg.enabled,
+         timezone=config.agents.defaults.timezone,
+@@ -722,6 +854,8 @@
+     from nanobot.cron.service import CronService
+ 
+     config = _load_runtime_config(config, workspace)
++    from nanobot.utils.omega_log import init_omega_logging
++    init_omega_logging(config.omega_logging)
+     sync_workspace_templates(config.workspace_path)
+ 
+     bus = MessageBus()
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/config/schema.py nanobot/config/schema.py
+--- nanobot/config/schema.py	2026-07-12 03:11:59.644296314 +0000
++++ nanobot/config/schema.py	2026-04-28 00:02:09.261997225 +0000
+@@ -93,7 +93,8 @@
+ 
+     enabled: bool = True
+     interval_s: int = 30 * 60  # 30 minutes
+-    keep_recent_messages: int = 8
++    model: str | None = None
++    provider: str | None = None
+ 
+ 
+ class GatewayConfig(Base):
+@@ -158,6 +159,7 @@
+     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+     tools: ToolsConfig = Field(default_factory=ToolsConfig)
++    omega_logging: bool = False  # Total firehose debug logging
+ 
+     @property
+     def workspace_path(self) -> Path:
+@@ -165,12 +167,12 @@
+         return Path(self.agents.defaults.workspace).expanduser()
+ 
+     def _match_provider(
+-        self, model: str | None = None
++        self, model: str | None = None, forced_provider: str | None = None,
+     ) -> tuple["ProviderConfig | None", str | None]:
+         """Match provider config and its registry name. Returns (config, spec_name)."""
+         from nanobot.providers.registry import PROVIDERS, find_by_name
+ 
+-        forced = self.agents.defaults.provider
++        forced = forced_provider or self.agents.defaults.provider
+         if forced != "auto":
+             spec = find_by_name(forced)
+             if spec:
+@@ -229,26 +231,26 @@
+                 return p, spec.name
+         return None, None
+ 
+-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
++    def get_provider(self, model: str | None = None, forced_provider: str | None = None) -> ProviderConfig | None:
+         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
+-        p, _ = self._match_provider(model)
++        p, _ = self._match_provider(model, forced_provider=forced_provider)
+         return p
+ 
+-    def get_provider_name(self, model: str | None = None) -> str | None:
++    def get_provider_name(self, model: str | None = None, forced_provider: str | None = None) -> str | None:
+         """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
+-        _, name = self._match_provider(model)
++        _, name = self._match_provider(model, forced_provider=forced_provider)
+         return name
+ 
+-    def get_api_key(self, model: str | None = None) -> str | None:
++    def get_api_key(self, model: str | None = None, forced_provider: str | None = None) -> str | None:
+         """Get API key for the given model. Falls back to first available key."""
+-        p = self.get_provider(model)
++        p = self.get_provider(model, forced_provider=forced_provider)
+         return p.api_key if p else None
+ 
+-    def get_api_base(self, model: str | None = None) -> str | None:
++    def get_api_base(self, model: str | None = None, forced_provider: str | None = None) -> str | None:
+         """Get API base URL for the given model. Applies default URLs for gateway/local providers."""
+         from nanobot.providers.registry import find_by_name
+ 
+-        p, name = self._match_provider(model)
++        p, name = self._match_provider(model, forced_provider=forced_provider)
+         if p and p.api_base:
+             return p.api_base
+         # Only gateways get a default api_base here. Standard providers
+@@ -259,4 +261,9 @@
+                 return spec.default_api_base
+         return None
+ 
+-    model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
++    model_config = ConfigDict(
++        alias_generator=to_camel,
++        populate_by_name=True,
++        env_prefix="NANOBOT_",
++        env_nested_delimiter="__",
++    )
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/heartbeat/service.py nanobot/heartbeat/service.py
+--- nanobot/heartbeat/service.py	2026-07-12 03:11:59.646296337 +0000
++++ nanobot/heartbeat/service.py	2026-06-01 06:16:55.294039250 +0000
+@@ -36,14 +36,22 @@
+     }
+ ]
+ 
++_PHASE1_SYSTEM_PROMPT = (
++    "You are a heartbeat agent. Your ONLY job is to call the heartbeat tool to report your decision."
++    " You have access to the user's conversation history and memory files."
++    " Decide whether any of the recurring tasks in HEARTBEAT.md need to be run now,"
++    " considering the conversation context and any relevant information in MEMORY.md."
++)
++
+ 
+ class HeartbeatService:
+     """
+     Periodic heartbeat service that wakes the agent to check for tasks.
+ 
+-    Phase 1 (decision): reads HEARTBEAT.md and asks the LLM — via a virtual
+-    tool call — whether there are active tasks.  This avoids free-text parsing
+-    and the unreliable HEARTBEAT_OK token.
++    Phase 1 (decision): reads HEARTBEAT.md and MEMORY.md alongside the active
++    chat session's conversation history, then asks a lightweight LLM — via a
++    virtual tool call — whether there are active tasks.  Uses a configurable
++    cheaper model/provider (``decide_provider`` / ``decide_model``).
+ 
+     Phase 2 (execution): only triggered when Phase 1 returns ``run``.  The
+     ``on_execute`` callback runs the task through the full agent loop and
+@@ -55,8 +63,11 @@
+         workspace: Path,
+         provider: LLMProvider,
+         model: str,
++        decide_provider: LLMProvider,
++        decide_model: str,
+         on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
+         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
++        get_chat_history: Callable[[], tuple[list[dict[str, Any]], str | None, str | None]] | None = None,
+         interval_s: int = 30 * 60,
+         enabled: bool = True,
+         timezone: str | None = None,
+@@ -64,8 +75,11 @@
+         self.workspace = workspace
+         self.provider = provider
+         self.model = model
++        self.decide_provider = decide_provider
++        self.decide_model = decide_model
+         self.on_execute = on_execute
+         self.on_notify = on_notify
++        self.get_chat_history = get_chat_history
+         self.interval_s = interval_s
+         self.enabled = enabled
+         self.timezone = timezone
+@@ -76,6 +90,10 @@
+     def heartbeat_file(self) -> Path:
+         return self.workspace / "HEARTBEAT.md"
+ 
++    @property
++    def memory_file(self) -> Path:
++        return self.workspace / "memory" / "MEMORY.md"
++
+     def _read_heartbeat_file(self) -> str | None:
+         if self.heartbeat_file.exists():
+             try:
+@@ -84,24 +102,78 @@
+                 return None
+         return None
+ 
++    def _read_memory_file(self) -> str:
++        if self.memory_file.exists():
++            try:
++                return self.memory_file.read_text(encoding="utf-8")
++            except Exception:
++                return ""
++        return ""
++
+     async def _decide(self, content: str) -> tuple[str, str]:
+-        """Phase 1: ask LLM to decide skip/run via virtual tool call.
++        """Phase 1: ask a lightweight LLM to decide skip/run via virtual tool call.
+ 
+         Returns (action, tasks) where action is 'skip' or 'run'.
+         """
+-        from nanobot.utils.helpers import current_time_str
++        from datetime import datetime
++
++        from nanobot.utils.helpers import current_time_str, format_datetime, format_message_timestamp
++
++        chat_history: list[dict[str, Any]] = []
++        last_user_ts: str | None = None
++        if self.get_chat_history:
++            chat_history, _, last_user_ts = self.get_chat_history()
++
++        # Prepend compact timestamps to user and assistant messages so the
++        # model can see when each message was sent.
++        for msg in chat_history:
++            if msg.get("role") in ("user", "assistant") and msg.get("timestamp"):
++                ts_label = format_message_timestamp(msg["timestamp"], self.timezone)
++                c = msg.get("content", "")
++                msg["content"] = f"{ts_label} {c}" if c else ts_label
++                del msg["timestamp"]
++
++        memory_content = self._read_memory_file()
++
++        user_parts: list[str] = []
++        user_parts.append(f"Current Time: {current_time_str(self.timezone)}")
++
++        if last_user_ts:
++            try:
++                last_dt = datetime.fromisoformat(last_user_ts)
++                user_parts.append(f"Time of last message from user: {format_datetime(last_dt, self.timezone)}")
++            except (ValueError, TypeError):
++                pass
++
++        user_parts.append(
++            "Review the conversation history shown above along with the files below, and decide"
++            " whether there are active tasks that need to be performed now. Consider the"
++            " conversation history and the MEMORY.md contents to understand the user's context"
++            "and recent interactions."
++            " Note: This *is* the periodic heartbeat check. While this message shows as being from User, it is *not* a chat message from them, this is just how the heartbeat instruction appears."
++        )
++        if memory_content.strip():
++            user_parts.append(f"\n---MEMORY.md contents---\n{memory_content}")
++        user_parts.append(f"\n---HEARTBEAT.md contents---\n{content}")
++
++        user_message = {"role": "user", "content": "\n\n".join(user_parts)}
++
++        messages: list[dict[str, Any]] = [
++            {"role": "system", "content": _PHASE1_SYSTEM_PROMPT},
++        ]
++
++        if chat_history:
++            messages.extend(chat_history)
++            last_role = chat_history[-1].get("role", "")
++            if last_role == "user":
++                messages.append({"role": "assistant", "content": "[Acknowledged]"})
++
++        messages.append(user_message)
+ 
+-        response = await self.provider.chat_with_retry(
+-            messages=[
+-                {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
+-                {"role": "user", "content": (
+-                    f"Current Time: {current_time_str(self.timezone)}\n\n"
+-                    "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
+-                    f"{content}"
+-                )},
+-            ],
++        response = await self.decide_provider.chat_with_retry(
++            messages=messages,
+             tools=_HEARTBEAT_TOOL,
+-            model=self.model,
++            model=self.decide_model,
+         )
+ 
+         if not response.has_tool_calls:
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/providers/anthropic_provider.py nanobot/providers/anthropic_provider.py
+--- nanobot/providers/anthropic_provider.py	2026-07-12 03:11:59.647296348 +0000
++++ nanobot/providers/anthropic_provider.py	2026-04-27 22:26:12.657753027 +0000
+@@ -402,14 +402,38 @@
+         reasoning_effort: str | None = None,
+         tool_choice: str | dict[str, Any] | None = None,
+     ) -> LLMResponse:
++        from nanobot.utils.omega_log import aomega_log
+         kwargs = self._build_kwargs(
+             messages, tools, model, max_tokens, temperature,
+             reasoning_effort, tool_choice,
+         )
++        await aomega_log("LLM_REQUEST", {
++            "provider": "anthropic",
++            "api_base": str(getattr(self._client, "base_url", "")),
++            "default_headers": dict(getattr(self._client, "default_headers", {})),
++            "kwargs": kwargs,
++        })
+         try:
+             response = await self._client.messages.create(**kwargs)
+-            return self._parse_response(response)
++            parsed = self._parse_response(response)
++            await aomega_log("LLM_RESPONSE", {
++                "provider": "anthropic",
++                "parsed": {
++                    "content": parsed.content,
++                    "tool_calls": [tc.to_openai_tool_call() for tc in parsed.tool_calls],
++                    "finish_reason": parsed.finish_reason,
++                    "usage": parsed.usage,
++                    "reasoning_content": parsed.reasoning_content,
++                    "thinking_blocks": parsed.thinking_blocks,
++                },
++            })
++            return parsed
+         except Exception as e:
++            await aomega_log("LLM_ERROR", {
++                "provider": "anthropic",
++                "error": repr(e),
++                "error_type": type(e).__name__,
++            })
+             return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+ 
+     async def chat_stream(
+@@ -423,18 +447,44 @@
+         tool_choice: str | dict[str, Any] | None = None,
+         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+     ) -> LLMResponse:
++        from nanobot.utils.omega_log import aomega_log
+         kwargs = self._build_kwargs(
+             messages, tools, model, max_tokens, temperature,
+             reasoning_effort, tool_choice,
+         )
++        await aomega_log("LLM_REQUEST", {
++            "provider": "anthropic",
++            "api_base": str(getattr(self._client, "base_url", "")),
++            "default_headers": dict(getattr(self._client, "default_headers", {})),
++            "kwargs": kwargs,
++            "stream": True,
++        })
+         try:
+             async with self._client.messages.stream(**kwargs) as stream:
+                 if on_content_delta:
+                     async for text in stream.text_stream:
+                         await on_content_delta(text)
+                 response = await stream.get_final_message()
+-            return self._parse_response(response)
++            parsed = self._parse_response(response)
++            await aomega_log("LLM_RESPONSE", {
++                "provider": "anthropic",
++                "stream": True,
++                "parsed": {
++                    "content": parsed.content,
++                    "tool_calls": [tc.to_openai_tool_call() for tc in parsed.tool_calls],
++                    "finish_reason": parsed.finish_reason,
++                    "usage": parsed.usage,
++                    "reasoning_content": parsed.reasoning_content,
++                    "thinking_blocks": parsed.thinking_blocks,
++                },
++            })
++            return parsed
+         except Exception as e:
++            await aomega_log("LLM_ERROR", {
++                "provider": "anthropic",
++                "error": repr(e),
++                "error_type": type(e).__name__,
++            })
+             return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+ 
+     def get_default_model(self) -> str:
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/providers/azure_openai_provider.py nanobot/providers/azure_openai_provider.py
+--- nanobot/providers/azure_openai_provider.py	2026-07-12 03:11:59.647296348 +0000
++++ nanobot/providers/azure_openai_provider.py	2026-04-27 22:26:53.946331657 +0000
+@@ -137,6 +137,7 @@
+         Returns:
+             LLMResponse with content and/or tool calls.
+         """
++        from nanobot.utils.omega_log import aomega_log
+         deployment_name = model or self.default_model
+         url = self._build_chat_url(deployment_name)
+         headers = self._build_headers()
+@@ -144,20 +145,49 @@
+             deployment_name, messages, tools, max_tokens, temperature, reasoning_effort,
+             tool_choice=tool_choice,
+         )
++        await aomega_log("LLM_REQUEST", {
++            "provider": "azure_openai",
++            "url": url,
++            "headers": headers,
++            "payload": payload,
++        })
+ 
+         try:
+             async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
+                 response = await client.post(url, headers=headers, json=payload)
+                 if response.status_code != 200:
++                    await aomega_log("LLM_ERROR", {
++                        "provider": "azure_openai",
++                        "status_code": response.status_code,
++                        "response_text": response.text,
++                    })
+                     return LLMResponse(
+                         content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
+                         finish_reason="error",
+                     )
+                 
+                 response_data = response.json()
+-                return self._parse_response(response_data)
++                parsed = self._parse_response(response_data)
++                await aomega_log("LLM_RESPONSE", {
++                    "provider": "azure_openai",
++                    "status_code": response.status_code,
++                    "response_headers": dict(response.headers),
++                    "parsed": {
++                        "content": parsed.content,
++                        "tool_calls": [tc.to_openai_tool_call() for tc in parsed.tool_calls],
++                        "finish_reason": parsed.finish_reason,
++                        "usage": parsed.usage,
++                        "reasoning_content": parsed.reasoning_content,
++                    },
++                })
++                return parsed
+ 
+         except Exception as e:
++            await aomega_log("LLM_ERROR", {
++                "provider": "azure_openai",
++                "error": repr(e),
++                "error_type": type(e).__name__,
++            })
+             return LLMResponse(
+                 content=f"Error calling Azure OpenAI: {repr(e)}",
+                 finish_reason="error",
+@@ -222,6 +252,7 @@
+         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+     ) -> LLMResponse:
+         """Stream a chat completion via Azure OpenAI SSE."""
++        from nanobot.utils.omega_log import aomega_log
+         deployment_name = model or self.default_model
+         url = self._build_chat_url(deployment_name)
+         headers = self._build_headers()
+@@ -230,18 +261,46 @@
+             reasoning_effort, tool_choice=tool_choice,
+         )
+         payload["stream"] = True
++        await aomega_log("LLM_REQUEST", {
++            "provider": "azure_openai",
++            "url": url,
++            "headers": headers,
++            "payload": payload,
++            "stream": True,
++        })
+ 
+         try:
+             async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
+                 async with client.stream("POST", url, headers=headers, json=payload) as response:
+                     if response.status_code != 200:
+                         text = await response.aread()
++                        await aomega_log("LLM_ERROR", {
++                            "provider": "azure_openai",
++                            "status_code": response.status_code,
++                            "response_text": text.decode("utf-8", "ignore"),
++                        })
+                         return LLMResponse(
+                             content=f"Azure OpenAI API Error {response.status_code}: {text.decode('utf-8', 'ignore')}",
+                             finish_reason="error",
+                         )
+-                    return await self._consume_stream(response, on_content_delta)
++                    parsed = await self._consume_stream(response, on_content_delta)
++                    await aomega_log("LLM_RESPONSE", {
++                        "provider": "azure_openai",
++                        "stream": True,
++                        "parsed": {
++                            "content": parsed.content,
++                            "tool_calls": [tc.to_openai_tool_call() for tc in parsed.tool_calls],
++                            "finish_reason": parsed.finish_reason,
++                            "usage": parsed.usage,
++                        },
++                    })
++                    return parsed
+         except Exception as e:
++            await aomega_log("LLM_ERROR", {
++                "provider": "azure_openai",
++                "error": repr(e),
++                "error_type": type(e).__name__,
++            })
+             return LLMResponse(content=f"Error calling Azure OpenAI: {repr(e)}", finish_reason="error")
+ 
+     async def _consume_stream(
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/providers/base.py nanobot/providers/base.py
+--- nanobot/providers/base.py	2026-07-12 03:11:59.648296360 +0000
++++ nanobot/providers/base.py	2026-04-27 22:27:59.906252664 +0000
+@@ -275,6 +275,7 @@
+         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+     ) -> LLMResponse:
+         """Call chat_stream() with retry on transient provider failures."""
++        from nanobot.utils.omega_log import aomega_log
+         if max_tokens is self._SENTINEL:
+             max_tokens = self.generation.max_tokens
+         if temperature is self._SENTINEL:
+@@ -307,6 +308,12 @@
+                 attempt, len(self._CHAT_RETRY_DELAYS), delay,
+                 (response.content or "")[:120].lower(),
+             )
++            await aomega_log("LLM_RETRY", {
++                "method": "chat_stream",
++                "attempt": attempt,
++                "delay": delay,
++                "error_content": response.content,
++            })
+             await asyncio.sleep(delay)
+ 
+         return await self._safe_chat_stream(**kw)
+@@ -327,6 +334,7 @@
+         so callers no longer need to thread temperature / max_tokens /
+         reasoning_effort through every layer.
+         """
++        from nanobot.utils.omega_log import aomega_log
+         if max_tokens is self._SENTINEL:
+             max_tokens = self.generation.max_tokens
+         if temperature is self._SENTINEL:
+@@ -358,6 +366,12 @@
+                 attempt, len(self._CHAT_RETRY_DELAYS), delay,
+                 (response.content or "")[:120].lower(),
+             )
++            await aomega_log("LLM_RETRY", {
++                "method": "chat",
++                "attempt": attempt,
++                "delay": delay,
++                "error_content": response.content,
++            })
+             await asyncio.sleep(delay)
+ 
+         return await self._safe_chat(**kw)
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/providers/openai_codex_provider.py nanobot/providers/openai_codex_provider.py
+--- nanobot/providers/openai_codex_provider.py	2026-07-12 03:11:59.648296360 +0000
++++ nanobot/providers/openai_codex_provider.py	2026-04-27 22:27:18.513675160 +0000
+@@ -35,6 +35,7 @@
+         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+     ) -> LLMResponse:
+         """Shared request logic for both chat() and chat_stream()."""
++        from nanobot.utils.omega_log import aomega_log
+         model = model or self.default_model
+         system_prompt, input_items = _convert_messages(messages)
+ 
+@@ -58,6 +59,13 @@
+         if tools:
+             body["tools"] = _convert_tools(tools)
+ 
++        await aomega_log("LLM_REQUEST", {
++            "provider": "openai_codex",
++            "url": DEFAULT_CODEX_URL,
++            "headers": headers,
++            "body": body,
++        })
++
+         try:
+             try:
+                 content, tool_calls, finish_reason = await _request_codex(
+@@ -66,14 +74,33 @@
+                 )
+             except Exception as e:
+                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
++                    await aomega_log("LLM_ERROR", {
++                        "provider": "openai_codex",
++                        "error": repr(e),
++                        "error_type": type(e).__name__,
++                    })
+                     raise
+                 logger.warning("SSL verification failed for Codex API; retrying with verify=False")
+                 content, tool_calls, finish_reason = await _request_codex(
+                     DEFAULT_CODEX_URL, headers, body, verify=False,
+                     on_content_delta=on_content_delta,
+                 )
+-            return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
++            parsed = LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
++            await aomega_log("LLM_RESPONSE", {
++                "provider": "openai_codex",
++                "parsed": {
++                    "content": parsed.content,
++                    "tool_calls": [tc.to_openai_tool_call() for tc in parsed.tool_calls],
++                    "finish_reason": parsed.finish_reason,
++                },
++            })
++            return parsed
+         except Exception as e:
++            await aomega_log("LLM_ERROR", {
++                "provider": "openai_codex",
++                "error": repr(e),
++                "error_type": type(e).__name__,
++            })
+             return LLMResponse(content=f"Error calling Codex: {e}", finish_reason="error")
+ 
+     async def chat(
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/providers/openai_compat_provider.py nanobot/providers/openai_compat_provider.py
+--- nanobot/providers/openai_compat_provider.py	2026-07-12 03:11:59.649296371 +0000
++++ nanobot/providers/openai_compat_provider.py	2026-04-27 22:25:44.139352335 +0000
+@@ -546,13 +546,39 @@
+         reasoning_effort: str | None = None,
+         tool_choice: str | dict[str, Any] | None = None,
+     ) -> LLMResponse:
++        from nanobot.utils.omega_log import aomega_log
+         kwargs = self._build_kwargs(
+             messages, tools, model, max_tokens, temperature,
+             reasoning_effort, tool_choice,
+         )
++        await aomega_log("LLM_REQUEST", {
++            "provider": "openai_compat",
++            "api_base": str(self._client.base_url),
++            "default_headers": dict(self._client.default_headers),
++            "kwargs": kwargs,
++        })
+         try:
+-            return self._parse(await self._client.chat.completions.create(**kwargs))
++            raw = await self._client.chat.completions.create(**kwargs)
++            parsed = self._parse(raw)
++            await aomega_log("LLM_RESPONSE", {
++                "provider": "openai_compat",
++                "raw_type": type(raw).__name__,
++                "parsed": {
++                    "content": parsed.content,
++                    "tool_calls": [tc.to_openai_tool_call() for tc in parsed.tool_calls],
++                    "finish_reason": parsed.finish_reason,
++                    "usage": parsed.usage,
++                    "reasoning_content": parsed.reasoning_content,
++                    "thinking_blocks": parsed.thinking_blocks,
++                },
++            })
++            return parsed
+         except Exception as e:
++            await aomega_log("LLM_ERROR", {
++                "provider": "openai_compat",
++                "error": repr(e),
++                "error_type": type(e).__name__,
++            })
+             return self._handle_error(e)
+ 
+     async def chat_stream(
+@@ -566,12 +592,19 @@
+         tool_choice: str | dict[str, Any] | None = None,
+         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+     ) -> LLMResponse:
++        from nanobot.utils.omega_log import aomega_log
+         kwargs = self._build_kwargs(
+             messages, tools, model, max_tokens, temperature,
+             reasoning_effort, tool_choice,
+         )
+         kwargs["stream"] = True
+         kwargs["stream_options"] = {"include_usage": True}
++        await aomega_log("LLM_REQUEST", {
++            "provider": "openai_compat",
++            "api_base": str(self._client.base_url),
++            "default_headers": dict(self._client.default_headers),
++            "kwargs": kwargs,
++        })
+         try:
+             stream = await self._client.chat.completions.create(**kwargs)
+             chunks: list[Any] = []
+@@ -581,8 +614,26 @@
+                     text = getattr(chunk.choices[0].delta, "content", None)
+                     if text:
+                         await on_content_delta(text)
+-            return self._parse_chunks(chunks)
++            parsed = self._parse_chunks(chunks)
++            await aomega_log("LLM_RESPONSE", {
++                "provider": "openai_compat",
++                "stream": True,
++                "parsed": {
++                    "content": parsed.content,
++                    "tool_calls": [tc.to_openai_tool_call() for tc in parsed.tool_calls],
++                    "finish_reason": parsed.finish_reason,
++                    "usage": parsed.usage,
++                    "reasoning_content": parsed.reasoning_content,
++                    "thinking_blocks": parsed.thinking_blocks,
++                },
++            })
++            return parsed
+         except Exception as e:
++            await aomega_log("LLM_ERROR", {
++                "provider": "openai_compat",
++                "error": repr(e),
++                "error_type": type(e).__name__,
++            })
+             return self._handle_error(e)
+ 
+     def get_default_model(self) -> str:
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/session/manager.py nanobot/session/manager.py
+--- nanobot/session/manager.py	2026-07-12 03:11:59.651296394 +0000
++++ nanobot/session/manager.py	2026-05-02 09:51:37.238818775 +0000
+@@ -86,7 +86,7 @@
+         out: list[dict[str, Any]] = []
+         for message in sliced:
+             entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
+-            for key in ("tool_calls", "tool_call_id", "name"):
++            for key in ("tool_calls", "tool_call_id", "name", "timestamp"):
+                 if key in message:
+                     entry[key] = message[key]
+             out.append(entry)
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/utils/helpers.py nanobot/utils/helpers.py
+--- nanobot/utils/helpers.py	2026-07-12 03:11:59.660296496 +0000
++++ nanobot/utils/helpers.py	2026-06-14 12:28:37.920635387 +0000
+@@ -11,6 +11,16 @@
+ import tiktoken
+ 
+ 
++_LEADING_TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*")
++
++
++def strip_leading_timestamp(text: str | None) -> str | None:
++    """Remove an accidental leading message-history timestamp from model output."""
++    if not text:
++        return text
++    return _LEADING_TIMESTAMP_RE.sub("", text)
++
++
+ def strip_think(text: str) -> str:
+     """Remove <think>…</think> blocks and any unclosed trailing <think> tag."""
+     text = re.sub(r"<think>[\s\S]*?</think>", "", text)
+@@ -55,11 +65,11 @@
+     return datetime.now().isoformat()
+ 
+ 
+-def current_time_str(timezone: str | None = None) -> str:
+-    """Human-readable current time with weekday and UTC offset.
++def format_datetime(dt: datetime, timezone: str | None = None) -> str:
++    """Format a datetime using the same style as current_time_str.
+ 
+-    When *timezone* is a valid IANA name (e.g. ``"Asia/Shanghai"``), the time
+-    is converted to that zone.  Otherwise falls back to the host local time.
++    When *timezone* is a valid IANA name the result is converted to that zone.
++    Otherwise the host local timezone is used.
+     """
+     from zoneinfo import ZoneInfo
+ 
+@@ -68,11 +78,46 @@
+     except (KeyError, Exception):
+         tz = None
+ 
+-    now = datetime.now(tz=tz) if tz else datetime.now().astimezone()
+-    offset = now.strftime("%z")
++    if tz:
++        dt = dt.astimezone(tz)
++    elif dt.tzinfo is None:
++        dt = dt.astimezone()
++
++    offset = dt.strftime("%z")
+     offset_fmt = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
+-    tz_name = timezone or (time.strftime("%Z") or "UTC")
+-    return f"{now.strftime('%Y-%m-%d %H:%M (%A)')} ({tz_name}, UTC{offset_fmt})"
++    tz_name = timezone or (dt.strftime("%Z") or "UTC")
++    return f"{dt.strftime('%Y-%m-%d %H:%M (%A)')} ({tz_name}, UTC{offset_fmt})"
++
++
++def format_message_timestamp(ts: str, timezone: str | None = None) -> str:
++    """Format an ISO timestamp string as a compact inline label for message history.
++
++    Returns something like ``[2025-05-02 14:30]`` using the configured timezone.
++    Falls back to the raw string when parsing fails.
++    """
++    try:
++        dt = datetime.fromisoformat(ts)
++    except (ValueError, TypeError):
++        return ts
++    from zoneinfo import ZoneInfo
++    try:
++        tz = ZoneInfo(timezone) if timezone else None
++    except (KeyError, Exception):
++        tz = None
++    if tz:
++        dt = dt.astimezone(tz)
++    elif dt.tzinfo is None:
++        dt = dt.astimezone()
++    return dt.strftime("[%Y-%m-%d %H:%M]")
++
++
++def current_time_str(timezone: str | None = None) -> str:
++    """Human-readable current time with weekday and UTC offset.
++
++    When *timezone* is a valid IANA name (e.g. ``"Asia/Shanghai"``), the time
++    is converted to that zone.  Otherwise falls back to the host local time.
++    """
++    return format_datetime(datetime.now().astimezone(), timezone)
+ 
+ 
+ _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
+diff -ruN '--exclude=__pycache__' '--exclude=bridge' nanobot/utils/omega_log.py nanobot/utils/omega_log.py
+--- nanobot/utils/omega_log.py	1970-01-01 00:00:00.000000000 +0000
++++ nanobot/utils/omega_log.py	2026-04-27 23:45:37.791813752 +0000
+@@ -0,0 +1,164 @@
++"""Omega Logging — total firehose debug logger.
++
++Appends EVERYTHING to a single plain-text log next to the config file.
++Controlled by "omega_logging": true in config.json.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import re
++import traceback
++import warnings
++from datetime import datetime
++from pathlib import Path
++from typing import Any
++
++from loguru import logger
++
++from nanobot.config.loader import get_config_path
++
++# Async lock for line-level atomicity under heavy concurrent load
++_OMEGA_LOCK: asyncio.Lock | None = None
++_OMEGA_LOGGER: logging.Logger | None = None
++_OMEGA_HANDLER: logging.Handler | None = None
++
++
++def _ensure_lock() -> asyncio.Lock:
++    global _OMEGA_LOCK
++    if _OMEGA_LOCK is None:
++        _OMEGA_LOCK = asyncio.Lock()
++    return _OMEGA_LOCK
++
++
++def _redact_images_in_obj(obj: Any) -> Any:
++    """Recursively replace base64 image strings with size placeholders."""
++    if isinstance(obj, str):
++        # Replace data:image/...;base64,... with a size hint
++        def _repl(m: re.Match) -> str:
++            full = m.group(0)
++            return f"[image: <{len(full)} bytes>]"
++        return re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", _repl, obj)
++    if isinstance(obj, list):
++        return [_redact_images_in_obj(item) for item in obj]
++    if isinstance(obj, dict):
++        return {k: _redact_images_in_obj(v) for k, v in obj.items()}
++    return obj
++
++
++def _fmt_payload(payload: Any) -> str:
++    """Serialize payload: dicts -> pretty JSON, everything else -> repr."""
++    payload = _redact_images_in_obj(payload)
++    if isinstance(payload, dict) or isinstance(payload, list):
++        try:
++            return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
++        except Exception:
++            return repr(payload)
++    return repr(payload)
++
++
++class _OmegaFormatter(logging.Formatter):
++    def format(self, record: logging.LogRecord) -> str:
++        ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S.%f")
++        banner = "=" * 80
++        payload = getattr(record, "omega_payload", None)
++        return f"\n{banner}\n{ts} :: {record.name} :: {record.getMessage()}\n{banner}\n{_fmt_payload(payload)}"
++
++
++def _omega_log_path() -> Path:
++    return get_config_path().parent / "nanobot_omega.log"
++
++
++def init_omega_logging(enabled: bool = False) -> None:
++    """Initialize the omega logger if enabled and not already initialized.
++
++    Any failure here is swallowed and logged via loguru so that a logging
++    setup problem can never prevent nanobot from starting.
++    """
++    global _OMEGA_LOGGER, _OMEGA_HANDLER
++
++    if not enabled:
++        return
++
++    if _OMEGA_LOGGER is not None:
++        return  # already initialized
++
++    try:
++        log_path = _omega_log_path()
++        log_path.parent.mkdir(parents=True, exist_ok=True)
++
++        handler = logging.FileHandler(str(log_path), mode="a", encoding="utf-8")
++        handler.setFormatter(_OmegaFormatter())
++        handler.setLevel(logging.DEBUG)
++
++        lg = logging.getLogger("OMEGA")
++        lg.setLevel(logging.DEBUG)
++        lg.addHandler(handler)
++        lg.propagate = False
++
++        _OMEGA_LOGGER = lg
++        _OMEGA_HANDLER = handler
++
++        # Capture all Python warnings
++        _install_warning_capture()
++
++        omega_log("OMEGA_INIT", {"log_path": str(log_path), "status": "initialized"})
++    except Exception as exc:
++        logger.warning("Omega logging initialization failed: {}", exc)
++        logger.debug(traceback.format_exc())
++
++
++def _install_warning_capture() -> None:
++    """Override warnings.showwarning to pipe into omega log."""
++    original_showwarning = warnings.showwarning
++
++    def _omega_showwarning(message, category, filename, lineno, file=None, line=None):
++        try:
++            omega_log(
++                "PYTHON_WARNING",
++                {
++                    "message": str(message),
++                    "category": category.__name__,
++                    "filename": filename,
++                    "lineno": lineno,
++                    "line": line,
++                },
++            )
++        except Exception:
++            pass
++        # Still call original so stderr gets it too
++        original_showwarning(message, category, filename, lineno, file, line)
++
++    warnings.showwarning = _omega_showwarning
++
++
++def omega_log(category: str, payload: Any) -> None:
++    """Synchronous omega log entry."""
++    if _OMEGA_LOGGER is None:
++        return
++    try:
++        record = _OMEGA_LOGGER.makeRecord(
++            _OMEGA_LOGGER.name,
++            logging.DEBUG,
++            "(omega)",
++            0,
++            category,
++            (),
++            None,
++        )
++        # Attach payload via custom attribute
++        record.omega_payload = payload  # type: ignore[attr-defined]
++        _OMEGA_LOGGER.handle(record)
++    except Exception:
++        # Never let logging itself crash the application
++        pass
++
++
++async def aomega_log(category: str, payload: Any) -> None:
++    """Async-safe omega log entry with lock guarding."""
++    if _OMEGA_LOGGER is None:
++        return
++    async with _ensure_lock():
++        omega_log(category, payload)

@@ -1,0 +1,18 @@
+[Unit]
+Description=Nanobot AI Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=hotrootsoup
+Group=hotrootsoup
+WorkingDirectory=/home/hotrootsoup/nanobot
+ExecStart=/home/hotrootsoup/nanobot/bot-env/bin/nanobot gateway
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/hotrootsoup
+
+[Install]
+WantedBy=multi-user.target

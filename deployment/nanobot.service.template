@@ -1,0 +1,20 @@
+[Unit]
+Description=Nanobot AI Gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@WORKDIR@
+ExecStart=@VENV@/bin/nanobot gateway
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=@HOME@
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

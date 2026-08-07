@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+bot-env/
+node_modules/
+dist/
+build/
+
+# Secrets and mutable nanobot instance data do not belong in source control.
+.env
+.env.*
+config.json
+*.log
+*.jsonl
+sessions/
+media/
+.nanobot/
+
+# Deployment leftovers and local backups.
+*.bak
+*.backup
+nanobot-stage-*/
+nanobot-source-backups/
