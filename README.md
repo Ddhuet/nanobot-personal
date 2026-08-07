@@ -18,7 +18,8 @@ starting the service remain deliberate operator actions.
 
 ```text
 src/nanobot/                       complete customized Python package
-setup.sh                           safer installer/deployer for this snapshot
+deploy.sh                          routine code-only deployment to an existing venv
+setup.sh                           first-time/recovery environment installer
 scripts/check-live-diff.sh         compares repo source with a deployed venv
 deployment/setup-original.sh      original recovery script, preserved verbatim
 deployment/nanobot-custom.patch   original customization patch
@@ -31,14 +32,15 @@ environment/nanobot-version.txt    pinned base distribution version
 STRUCTURE.md                       detailed map of the original VPS deployment
 ```
 
-The two deployment approaches are intentionally preserved:
+The deployment paths are intentionally separated:
 
 1. `deployment/setup-original.sh` installs the pinned wheel and applies the
    historical patch. It is an archival recovery artifact and should not be run
    casually.
-2. The root `setup.sh` installs the pinned dependencies when necessary and
-   deploys the complete, reviewed `src/nanobot` tree. This is the recommended
-   path after testing.
+2. The root `setup.sh` is for initial installation or recovery. It creates a
+   missing venv, installs the pinned dependencies, and then calls `deploy.sh`.
+3. The root `deploy.sh` is the normal code-only deployment command. It never
+   runs pip or controls systemd.
 
 ## Normal edit and deploy workflow
 
@@ -62,12 +64,12 @@ Deploy a committed version to this VPS:
 sudo systemctl stop nanobot
 cd ~/nanobot-personal
 ./scripts/check-live-diff.sh || true
-./setup.sh
+./deploy.sh
 sudo systemctl start nanobot
 sudo systemctl status nanobot --no-pager
 ```
 
-`setup.sh` copies the repository source into the virtualenv's site-packages.
+`deploy.sh` copies the repository source into the virtualenv's site-packages.
 Before replacement, it stores the previous package under
 `~/nanobot/source-backups`. Therefore Python will continue importing from the
 apparently strange but normal venv path:
@@ -76,7 +78,7 @@ apparently strange but normal venv path:
 ~/nanobot/bot-env/lib/python3.12/site-packages/nanobot
 ```
 
-A Git edit does not change the running copy until `setup.sh` deploys it.
+A Git edit does not change the running copy until `deploy.sh` deploys it.
 
 ## Install on a new VPS
 

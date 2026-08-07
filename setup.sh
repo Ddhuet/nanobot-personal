@@ -4,11 +4,10 @@ IFS=$'\n\t'
 
 NANOBOT_VERSION="0.1.4.post6"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_DIR="$SCRIPT_DIR/src/nanobot"
 REQUIREMENTS_FILE="$SCRIPT_DIR/environment/requirements-runtime.txt"
 UNIT_TEMPLATE="$SCRIPT_DIR/deployment/nanobot.service.template"
+DEPLOY_SCRIPT="$SCRIPT_DIR/deploy.sh"
 VENV_DIR="${NANOBOT_VENV:-$HOME/nanobot/bot-env}"
-BACKUP_ROOT="${NANOBOT_BACKUP_DIR:-$HOME/nanobot/source-backups}"
 INSTALL_SYSTEMD=0
 ALLOW_PYTHON_MISMATCH=0
 
@@ -16,8 +15,8 @@ usage() {
     cat <<'EOF'
 Usage: ./setup.sh [options]
 
-Install the pinned nanobot environment when absent and deploy this repository's
-src/nanobot tree. The script never starts or enables the service.
+Create/recover the pinned nanobot environment, then call deploy.sh to install
+this repository's source. The script never starts or enables the service.
 
 Options:
   --venv PATH                       Override the virtualenv destination
@@ -68,8 +67,8 @@ if ((EUID == 0)); then
     exit 1
 fi
 
-if [[ ! -d "$SOURCE_DIR" || ! -f "$SOURCE_DIR/__init__.py" ]]; then
-    echo "ERROR: repository source is incomplete: $SOURCE_DIR" >&2
+if [[ ! -x "$DEPLOY_SCRIPT" ]]; then
+    echo "ERROR: deployment helper is missing or not executable: $DEPLOY_SCRIPT" >&2
     exit 1
 fi
 
@@ -151,54 +150,11 @@ else
     echo "Found nanobot-ai==$INSTALLED_VERSION; pip installation is not needed."
 fi
 
-SITE_PACKAGES="$("$RUNTIME_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-TARGET_DIR="$SITE_PACKAGES/nanobot"
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-STAGE_DIR="$SITE_PACKAGES/.nanobot-stage-$STAMP-$$"
-BACKUP_DIR="$BACKUP_ROOT/nanobot-$STAMP"
-
-if [[ "$SITE_PACKAGES" != "$VENV_DIR"/* ]]; then
-    echo "ERROR: refusing unexpected site-packages path: $SITE_PACKAGES" >&2
-    exit 1
+DEPLOY_ARGS=(--venv "$VENV_DIR")
+if ((ALLOW_PYTHON_MISMATCH)); then
+    DEPLOY_ARGS+=(--allow-python-version-mismatch)
 fi
-
-if [[ -e "$STAGE_DIR" || -e "$BACKUP_DIR" ]]; then
-    echo "ERROR: staging or backup destination already exists." >&2
-    exit 1
-fi
-
-install -d -m 0700 -- "$BACKUP_DIR"
-install -d -- "$STAGE_DIR"
-cp -a -- "$SOURCE_DIR/." "$STAGE_DIR/"
-
-echo "Compiling staged Python files as a syntax check..."
-if ! "$RUNTIME_PYTHON" -m compileall -q "$STAGE_DIR"; then
-    echo "ERROR: source compilation failed; deployed code was not changed." >&2
-    rm -rf -- "$STAGE_DIR"
-    exit 1
-fi
-
-HAD_TARGET=0
-if [[ -d "$TARGET_DIR" ]]; then
-    HAD_TARGET=1
-    mv -- "$TARGET_DIR" "$BACKUP_DIR/nanobot"
-fi
-
-if ! mv -- "$STAGE_DIR" "$TARGET_DIR"; then
-    echo "ERROR: deployment move failed; attempting rollback." >&2
-    if ((HAD_TARGET)) && [[ ! -e "$TARGET_DIR" ]]; then
-        mv -- "$BACKUP_DIR/nanobot" "$TARGET_DIR"
-    fi
-    exit 1
-fi
-
-DEPLOYED_FILE="$("$RUNTIME_PYTHON" -c 'import nanobot; print(nanobot.__file__)')"
-echo "Deployed customized source: $DEPLOYED_FILE"
-if ((HAD_TARGET)); then
-    echo "Previous source backup: $BACKUP_DIR/nanobot"
-else
-    echo "No previous package directory existed; backup directory: $BACKUP_DIR"
-fi
+"$DEPLOY_SCRIPT" "${DEPLOY_ARGS[@]}"
 
 if ((INSTALL_SYSTEMD)); then
     if [[ ! -f "$UNIT_TEMPLATE" ]]; then
@@ -236,6 +192,6 @@ if ((INSTALL_SYSTEMD)); then
 fi
 
 echo
-echo "Setup/deployment complete."
+echo "Initial setup/recovery complete."
 echo "Review status before starting: systemctl status nanobot --no-pager"
 echo "Start deliberately: sudo systemctl start nanobot"
