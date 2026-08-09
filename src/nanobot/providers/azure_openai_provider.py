@@ -310,6 +310,7 @@ class AzureOpenAIProvider(LLMProvider):
     ) -> LLMResponse:
         """Parse Azure OpenAI SSE stream into an LLMResponse."""
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_call_buffers: dict[int, dict[str, str]] = {}
         finish_reason = "stop"
 
@@ -338,6 +339,10 @@ class AzureOpenAIProvider(LLMProvider):
                 if on_content_delta:
                     await on_content_delta(text)
 
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                reasoning_parts.append(reasoning)
+
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 buf = tool_call_buffers.setdefault(idx, {"id": "", "name": "", "arguments": ""})
@@ -361,6 +366,7 @@ class AzureOpenAIProvider(LLMProvider):
             content="".join(content_parts) or None,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
+            reasoning_content="".join(reasoning_parts) or None,
         )
 
     def get_default_model(self) -> str:

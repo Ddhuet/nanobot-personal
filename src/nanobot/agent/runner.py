@@ -55,6 +55,19 @@ class AgentRunner:
     def __init__(self, provider: LLMProvider):
         self.provider = provider
 
+    @staticmethod
+    def _reasoning_fallback(response: Any) -> str | None:
+        """Return provider reasoning text when no final content was produced."""
+        if response.reasoning_content:
+            return response.reasoning_content
+
+        parts = [
+            block.get("thinking", "")
+            for block in (response.thinking_blocks or [])
+            if isinstance(block, dict) and block.get("thinking")
+        ]
+        return "\n\n".join(parts) or None
+
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
@@ -146,6 +159,10 @@ class AgentRunner:
                 await hook.on_stream_end(context, resuming=False)
 
             clean = hook.finalize_content(context, response.content)
+            if not clean:
+                reasoning = self._reasoning_fallback(response)
+                if reasoning:
+                    clean = hook.finalize_content(context, reasoning)
             if response.finish_reason == "error":
                 final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"

@@ -473,16 +473,25 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        streamed_content = False
+
+        async def _tracked_stream(content: str) -> None:
+            nonlocal streamed_content
+            if content:
+                streamed_content = True
+            if on_stream:
+                await on_stream(content)
+
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
+            on_stream=_tracked_stream if on_stream is not None else None,
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
         )
 
-        if final_content is None:
+        if not final_content:
             final_content = "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history))
@@ -496,7 +505,7 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None:
+        if streamed_content:
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
