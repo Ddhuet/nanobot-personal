@@ -73,10 +73,10 @@ class ReasoningFallbackTests(unittest.TestCase):
 
     def test_openai_stream_parser_preserves_reasoning_deltas(self) -> None:
         response = OpenAICompatProvider._parse_chunks([
-            {"choices": [{"delta": {"reasoning_content": "Part one "}}]},
+            {"choices": [{"delta": {"reasoning": "Part one "}}]},
             {
                 "choices": [{
-                    "delta": {"reasoning_content": "part two"},
+                    "delta": {"reasoning": "part two"},
                     "finish_reason": "stop",
                 }],
             },
@@ -84,6 +84,42 @@ class ReasoningFallbackTests(unittest.TestCase):
 
         self.assertIsNone(response.content)
         self.assertEqual(response.reasoning_content, "Part one part two")
+
+    def test_openrouter_reasoning_field_becomes_fallback_content(self) -> None:
+        provider = object.__new__(OpenAICompatProvider)
+        parsed = provider._parse({
+            "choices": [{
+                "message": {
+                    "content": None,
+                    "reasoning": "[2026-08-09 21:21] Reasoning-only reply",
+                },
+                "finish_reason": "stop",
+            }],
+        })
+
+        result = _run(parsed)
+
+        self.assertEqual(
+            result.final_content,
+            "Reasoning-only reply",
+        )
+
+    def test_reasoning_details_text_is_normalized(self) -> None:
+        provider = object.__new__(OpenAICompatProvider)
+        parsed = provider._parse({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "text": "First block"},
+                        {"type": "reasoning.text", "text": "Second block"},
+                    ],
+                },
+                "finish_reason": "stop",
+            }],
+        })
+
+        self.assertEqual(parsed.reasoning_content, "First block\n\nSecond block")
 
     def test_azure_stream_parser_preserves_reasoning_deltas(self) -> None:
         class _Response:

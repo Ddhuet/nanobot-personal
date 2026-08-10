@@ -307,6 +307,32 @@ class OpenAICompatProvider(LLMProvider):
         return str(value)
 
     @classmethod
+    def _extract_reasoning_content(cls, value: Any) -> str | None:
+        """Normalize reasoning text from OpenAI-compatible response variants."""
+        value_map = cls._maybe_mapping(value)
+        if value_map is not None:
+            get_value = value_map.get
+        else:
+            get_value = lambda key: getattr(value, key, None)
+
+        for key in ("reasoning_content", "reasoning"):
+            reasoning = cls._extract_text_content(get_value(key))
+            if reasoning:
+                return reasoning
+
+        parts: list[str] = []
+        for detail in get_value("reasoning_details") or []:
+            detail_map = cls._maybe_mapping(detail)
+            if detail_map is not None:
+                raw_text = detail_map.get("text") or detail_map.get("summary")
+            else:
+                raw_text = getattr(detail, "text", None) or getattr(detail, "summary", None)
+            text = cls._extract_text_content(raw_text)
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts) or None
+
+    @classmethod
     def _extract_usage(cls, response: Any) -> dict[str, int]:
         usage_obj = None
         response_map = cls._maybe_mapping(response)
@@ -356,7 +382,7 @@ class OpenAICompatProvider(LLMProvider):
             finish_reason = str(choice0.get("finish_reason") or "stop")
 
             raw_tool_calls: list[Any] = []
-            reasoning_content = msg0.get("reasoning_content")
+            reasoning_content = self._extract_reasoning_content(msg0)
             for ch in choices:
                 ch_map = self._maybe_mapping(ch) or {}
                 m = self._maybe_mapping(ch_map.get("message")) or {}
@@ -368,7 +394,7 @@ class OpenAICompatProvider(LLMProvider):
                 if not content:
                     content = self._extract_text_content(m.get("content"))
                 if not reasoning_content:
-                    reasoning_content = m.get("reasoning_content")
+                    reasoning_content = self._extract_reasoning_content(m)
 
             parsed_tool_calls = []
             for tc in raw_tool_calls:
@@ -401,6 +427,7 @@ class OpenAICompatProvider(LLMProvider):
         choice = response.choices[0]
         msg = choice.message
         content = msg.content
+        reasoning_content = self._extract_reasoning_content(msg)
         finish_reason = choice.finish_reason
 
         raw_tool_calls: list[Any] = []
@@ -412,6 +439,8 @@ class OpenAICompatProvider(LLMProvider):
                     finish_reason = ch.finish_reason
             if not content and m.content:
                 content = m.content
+            if not reasoning_content:
+                reasoning_content = self._extract_reasoning_content(m)
 
         tool_calls = []
         for tc in raw_tool_calls:
@@ -433,7 +462,7 @@ class OpenAICompatProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
-            reasoning_content=getattr(msg, "reasoning_content", None) or None,
+            reasoning_content=reasoning_content,
         )
 
     @classmethod
@@ -493,7 +522,7 @@ class OpenAICompatProvider(LLMProvider):
                 text = cls._extract_text_content(delta.get("content"))
                 if text:
                     content_parts.append(text)
-                reasoning = cls._extract_text_content(delta.get("reasoning_content"))
+                reasoning = cls._extract_reasoning_content(delta)
                 if reasoning:
                     reasoning_parts.append(reasoning)
                 for idx, tc in enumerate(delta.get("tool_calls") or []):
@@ -510,7 +539,7 @@ class OpenAICompatProvider(LLMProvider):
             delta = choice.delta
             if delta and delta.content:
                 content_parts.append(delta.content)
-            reasoning = getattr(delta, "reasoning_content", None) if delta else None
+            reasoning = cls._extract_reasoning_content(delta) if delta else None
             if reasoning:
                 reasoning_parts.append(reasoning)
             for tc in (delta.tool_calls or []) if delta else []:
