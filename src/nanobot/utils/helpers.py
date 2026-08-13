@@ -11,11 +11,18 @@ from typing import Any
 import tiktoken
 
 
-_LEADING_TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*")
+_LEADING_TIMESTAMP_RE = re.compile(
+    r"^[\s\u200b\ufeff]*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*"
+)
 
 
 def strip_leading_timestamp(text: str | None) -> str | None:
-    """Remove an accidental leading message-history timestamp from model output."""
+    """Remove an accidental leading message-history timestamp from model output.
+
+    Models sometimes put a newline, a zero-width space, or a byte-order mark
+    before the copied label.  Chat clients do not make those characters
+    visible, so tolerate them while still requiring the exact history label.
+    """
     if not text:
         return text
     return _LEADING_TIMESTAMP_RE.sub("", text)

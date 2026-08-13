@@ -245,7 +245,11 @@ class AgentLoop:
             async def before_execute_tools(self, context: AgentHookContext) -> None:
                 if on_progress:
                     if not on_stream:
-                        thought = loop_self._strip_think(context.response.content if context.response else None)
+                        from nanobot.utils.helpers import strip_leading_timestamp
+
+                        thought = strip_leading_timestamp(
+                            loop_self._strip_think(context.response.content if context.response else None)
+                        )
                         if thought:
                             await on_progress(thought)
                     tool_hint = loop_self._strip_think(loop_self._tool_hint(context.tool_calls))
@@ -588,9 +592,13 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             elif role == "assistant":
+                from nanobot.utils.helpers import strip_leading_timestamp
+
                 if isinstance(content, str):
-                    from nanobot.utils.helpers import strip_leading_timestamp
                     entry["content"] = strip_leading_timestamp(content)
+                reasoning_content = entry.get("reasoning_content")
+                if isinstance(reasoning_content, str):
+                    entry["reasoning_content"] = strip_leading_timestamp(reasoning_content)
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()

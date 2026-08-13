@@ -11,6 +11,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
+from nanobot.utils.helpers import strip_leading_timestamp
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
 _SEND_RETRY_DELAYS = (1, 2, 4)
@@ -162,6 +163,11 @@ class ChannelManager:
         if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not msg.metadata.get("_streamed"):
+            # Last line of defense for every non-streaming delivery path.  In
+            # particular, progress messages do not pass through the agent's
+            # final-content cleanup and could otherwise expose a copied
+            # history timestamp directly to Discord and similar channels.
+            msg.content = strip_leading_timestamp(msg.content) or ""
             await channel.send(msg)
 
     def _coalesce_stream_deltas(
