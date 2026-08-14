@@ -27,6 +27,8 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    # Exact originating conversation key (may include a topic/thread override).
+    session_key: str | None = None
 
 
 @dataclass

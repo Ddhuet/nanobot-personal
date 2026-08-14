@@ -15,14 +15,14 @@ class CronTool(Tool):
     def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
         self._cron = cron_service
         self._default_timezone = default_timezone
-        self._channel = ""
-        self._chat_id = ""
+        self._context: ContextVar[tuple[str, str, str]] = ContextVar(
+            "cron_delivery_context", default=("", "", ""),
+        )
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(self, channel: str, chat_id: str, session_key: str | None = None) -> None:
         """Set the current session context for delivery."""
-        self._channel = channel
-        self._chat_id = chat_id
+        self._context.set((channel, chat_id, session_key or f"{channel}:{chat_id}"))
 
     def set_cron_context(self, active: bool):
         """Mark whether the tool is executing inside a cron job callback."""
@@ -77,6 +77,7 @@ class CronTool(Tool):
                 "message": {"type": "string", "description": "Reminder message (for add)"},
                 "every_seconds": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Interval in seconds (for recurring tasks)",
                 },
                 "cron_expr": {
@@ -133,8 +134,13 @@ class CronTool(Tool):
     ) -> str:
         if not message:
             return "Error: message is required for add"
-        if not self._channel or not self._chat_id:
+        channel, chat_id, session_key = self._context.get()
+        if not channel or not chat_id:
             return "Error: no session context (channel/chat_id)"
+
+        supplied = sum(value is not None for value in (every_seconds, cron_expr, at))
+        if supplied != 1:
+            return "Error: exactly one of every_seconds, cron_expr, or at is required"
         if tz and not cron_expr:
             return "Error: tz can only be used with cron_expr"
         if tz:
@@ -143,14 +149,18 @@ class CronTool(Tool):
 
         # Build schedule
         delete_after = False
-        if every_seconds:
+        if every_seconds is not None:
+            if every_seconds <= 0:
+                return "Error: every_seconds must be greater than 0"
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
-        elif cron_expr:
+        elif cron_expr is not None:
+            if not cron_expr.strip():
+                return "Error: cron_expr must not be empty"
             effective_tz = tz or self._default_timezone
             if err := self._validate_timezone(effective_tz):
                 return err
             schedule = CronSchedule(kind="cron", expr=cron_expr, tz=effective_tz)
-        elif at:
+        elif at is not None:
             from zoneinfo import ZoneInfo
 
             try:
@@ -164,18 +174,19 @@ class CronTool(Tool):
             at_ms = int(dt.timestamp() * 1000)
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
-        else:
-            return "Error: either every_seconds, cron_expr, or at is required"
-
-        job = self._cron.add_job(
-            name=message[:30],
-            schedule=schedule,
-            message=message,
-            deliver=True,
-            channel=self._channel,
-            to=self._chat_id,
-            delete_after_run=delete_after,
-        )
+        try:
+            job = self._cron.add_job(
+                name=message[:30],
+                schedule=schedule,
+                message=message,
+                deliver=True,
+                channel=channel,
+                to=chat_id,
+                session_key=session_key,
+                delete_after_run=delete_after,
+            )
+        except ValueError as exc:
+            return f"Error: {exc}"
         return f"Created job '{job.name}' (id: {job.id})"
 
     def _format_timing(self, schedule: CronSchedule) -> str:

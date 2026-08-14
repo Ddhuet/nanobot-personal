@@ -1,7 +1,8 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextvars import ContextVar
 
 import os
 import select
@@ -561,54 +562,69 @@ def gateway(
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
         from nanobot.agent.tools.cron import CronTool
-        from nanobot.agent.tools.message import MessageTool
-        from nanobot.utils.evaluator import evaluate_response
+        from nanobot.agent.wakeup import execute_silent_wakeup
 
-        reminder_note = (
-            "[Scheduled Task] Timer finished.\n\n"
-            f"Task '{job.name}' has been triggered.\n"
-            f"Scheduled instruction: {job.payload.message}"
-        )
+        channel = job.payload.channel or "cli"
+        chat_id = job.payload.to or "direct"
+        chat_session_key = job.payload.session_key or f"{channel}:{chat_id}"
+
+        def _build_cron_task_message() -> str:
+            from datetime import datetime
+
+            from nanobot.utils.helpers import current_time_str, format_datetime
+
+            parts = [f"Current Time: {current_time_str(config.agents.defaults.timezone)}"]
+            chat_session = agent.sessions.get_or_create(chat_session_key)
+            for msg in reversed(chat_session.messages):
+                if msg.get("role") == "user" and msg.get("timestamp"):
+                    try:
+                        last_dt = datetime.fromisoformat(msg["timestamp"])
+                        parts.append(
+                            "Time of last message from user: "
+                            f"{format_datetime(last_dt, config.agents.defaults.timezone)}"
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                    break
+
+            parts.append(
+                "A scheduled cron timer has woken you to perform the following task:\n\n"
+                f"```\n{job.payload.message}\n```\n\n"
+                "Take the current conversation history and MEMORY.md contents into account, "
+                "then perform the task. This is a scheduled wakeup, not a new message from the user. "
+                "If you need to send the user anything, you MUST use the 'message' tool because they "
+                "will not see your regular output. If no user-facing message is needed, respond normally "
+                "with a very brief description for the log. Your regular response text is ONLY logged."
+            )
+            return "\n\n".join(parts)
 
         cron_tool = agent.tools.get("cron")
         cron_token = None
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
-            resp = await agent.process_direct(
-                reminder_note,
-                session_key=f"cron:{job.id}",
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
+            await execute_silent_wakeup(
+                agent,
+                instruction=_build_cron_task_message,
+                scratch_session_key=f"cron:{job.id}",
+                chat_session_key=chat_session_key,
+                channel=channel,
+                chat_id=chat_id,
+                priority=agent.TURN_PRIORITY_CRON,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
-
-        response = resp.content if resp else ""
-
-        message_tool = agent.tools.get("message")
-        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            return response
-
-        if job.payload.deliver and job.payload.to and response:
-            should_notify = await evaluate_response(
-                response, job.payload.message, provider, agent.model,
-            )
-            if should_notify:
-                from nanobot.bus.events import OutboundMessage
-                await bus.publish_outbound(OutboundMessage(
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to,
-                    content=response,
-                ))
-        return response
+        return ""
     cron.on_job = on_cron_job
 
     # Create channel manager
     channels = ChannelManager(config, bus)
 
     _INTERNAL_CHANNELS = {"cli", "system", "cron", "heartbeat"}
+    heartbeat_decision_target: ContextVar[tuple[str, str, str | None] | None] = ContextVar(
+        "heartbeat_decision_target", default=None,
+    )
 
     def _pick_heartbeat_target() -> tuple[str, str, str | None]:
         """Pick a routable channel/chat target for heartbeat-triggered messages.
@@ -655,7 +671,8 @@ def gateway(
 
     def _get_chat_history() -> tuple[list[dict[str, Any]], str | None, str | None]:
         """Return (chat_history, session_key, last_user_timestamp) from the most recent active chat session."""
-        _, _, chat_session_key = _pick_heartbeat_target()
+        target = heartbeat_decision_target.get() or _pick_heartbeat_target()
+        _, _, chat_session_key = target
         if not chat_session_key:
             return [], None, None
         session = agent.sessions.get_or_create(chat_session_key)
@@ -668,6 +685,19 @@ def gateway(
         logger.debug("Heartbeat: history for {} has {} messages, last_user_ts={}",
                       chat_session_key, len(history), last_user_ts)
         return history, chat_session_key, last_user_ts
+
+    @asynccontextmanager
+    async def _heartbeat_decision_guard():
+        """Serialize phase one behind user and cron turns for its selected chat."""
+        target = _pick_heartbeat_target()
+        channel, chat_id, chat_session_key = target
+        coordination_key = chat_session_key or f"{channel}:{chat_id}"
+        token = heartbeat_decision_target.set(target)
+        try:
+            async with agent.session_turn(coordination_key, agent.TURN_PRIORITY_HEARTBEAT):
+                yield
+        finally:
+            heartbeat_decision_target.reset(token)
 
     # Create heartbeat service
     hb_cfg = config.gateway.heartbeat
@@ -707,66 +737,23 @@ def gateway(
 
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
-        import json as _json
+        from nanobot.agent.wakeup import execute_silent_wakeup
 
         channel, chat_id, chat_session_key = _pick_heartbeat_target()
         logger.info("Heartbeat phase 2: channel={} chat_id={} session={}",
                      channel, chat_id, chat_session_key)
 
-        # Clear heartbeat session completely for a fresh start.
-        hb_session = agent.sessions.get_or_create("heartbeat")
-        hb_session.clear()
-
-        # Seed heartbeat session with a copy of the chat session history
-        # so the agent has full conversation context while executing the task.
-        if chat_session_key:
-            chat_session = agent.sessions.get_or_create(chat_session_key)
-            hb_session.messages = [dict(msg) for msg in chat_session.messages]
-            hb_session.last_consolidated = chat_session.last_consolidated
-            logger.debug("Heartbeat phase 2: seeded {} messages from {}",
-                          len(hb_session.messages), chat_session_key)
-
-        agent.sessions.save(hb_session)
-        initial_count = len(hb_session.messages)
-
-        task_message = _build_heartbeat_task_message(tasks, chat_session_key, config.agents.defaults.timezone)
-
-        async def _silent(*_args, **_kwargs):
-            pass
-
-        resp = await agent.process_direct(
-            task_message,
-            session_key="heartbeat",
+        await execute_silent_wakeup(
+            agent,
+            instruction=lambda: _build_heartbeat_task_message(
+                tasks, chat_session_key, config.agents.defaults.timezone,
+            ),
+            scratch_session_key="heartbeat",
+            chat_session_key=chat_session_key,
             channel=channel,
             chat_id=chat_id,
-            on_progress=_silent,
+            priority=agent.TURN_PRIORITY_HEARTBEAT,
         )
-
-        # Mirror 'message' tool-call content into the regular chat session
-        # so the conversation context stays current.  (The message tool already
-        # delivers the content to the user's channel via the bus during
-        # execution, so no separate notify step is needed.)
-        if chat_session_key:
-            hb_session = agent.sessions.get_or_create("heartbeat")
-            chat_session = agent.sessions.get_or_create(chat_session_key)
-            for msg in hb_session.messages[initial_count:]:
-                if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    for tc in msg["tool_calls"]:
-                        func = tc.get("function", {})
-                        if func.get("name") == "message":
-                            args = func.get("arguments", {})
-                            if isinstance(args, str):
-                                try:
-                                    args = _json.loads(args)
-                                except (_json.JSONDecodeError, TypeError):
-                                    continue
-                            content = args.get("content", "")
-                            if content:
-                                from nanobot.utils.helpers import strip_leading_timestamp
-                                content = strip_leading_timestamp(content)
-                                if content:
-                                    chat_session.add_message("assistant", content)
-            agent.sessions.save(chat_session)
 
         # Return empty string so the model's plain-text response is never
         # forwarded to the user's channel.  Only explicit 'message' tool
@@ -790,6 +777,7 @@ def gateway(
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
         get_chat_history=_get_chat_history,
+        decision_guard=_heartbeat_decision_guard,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,

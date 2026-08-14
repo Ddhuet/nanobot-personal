@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.coordination import SessionTurnCoordinator
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
@@ -51,6 +52,10 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    TURN_PRIORITY_USER = 0
+    TURN_PRIORITY_BACKGROUND = 1
+    TURN_PRIORITY_CRON = 1
+    TURN_PRIORITY_HEARTBEAT = 2
 
     def __init__(
         self,
@@ -109,7 +114,7 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._turn_coordinator = SessionTurnCoordinator()
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -174,12 +179,27 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        session_key: str | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
-            if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+        if tool := self.tools.get("message"):
+            if isinstance(tool, MessageTool):
+                tool.set_context(channel, chat_id, message_id)
+        if tool := self.tools.get("spawn"):
+            if isinstance(tool, SpawnTool):
+                tool.set_context(channel, chat_id, session_key)
+        if tool := self.tools.get("cron"):
+            if isinstance(tool, CronTool):
+                tool.set_context(channel, chat_id, session_key)
+
+    def session_turn(self, session_key: str, priority: int):
+        """Return a priority-aware context manager for one conversation turn."""
+        return self._turn_coordinator.turn(session_key, priority)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -210,6 +230,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        routing_session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -257,7 +278,9 @@ class AgentLoop:
                 for tc in context.tool_calls:
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
-                loop_self._set_tool_context(channel, chat_id, message_id)
+                loop_self._set_tool_context(
+                    channel, chat_id, message_id, routing_session_key,
+                )
 
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 from nanobot.utils.helpers import strip_leading_timestamp
@@ -320,9 +343,14 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
-        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        if msg.channel == "system":
+            coordination_key = msg.chat_id if ":" in msg.chat_id else f"cli:{msg.chat_id}"
+            priority = self.TURN_PRIORITY_BACKGROUND
+        else:
+            coordination_key = msg.session_key
+            priority = self.TURN_PRIORITY_USER
         gate = self._concurrency_gate or nullcontext()
-        async with lock, gate:
+        async with self.session_turn(coordination_key, priority), gate:
             try:
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
@@ -406,6 +434,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        routing_session_key: str | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -416,7 +445,9 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel, chat_id, msg.metadata.get("message_id"), key,
+            )
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
@@ -427,6 +458,7 @@ class AgentLoop:
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                routing_session_key=key,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
@@ -446,6 +478,7 @@ class AgentLoop:
         })
 
         key = session_key or msg.session_key
+        route_key = routing_session_key or key
         session = self.sessions.get_or_create(key)
 
         # Slash commands
@@ -456,7 +489,9 @@ class AgentLoop:
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel, msg.chat_id, msg.metadata.get("message_id"), route_key,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -493,6 +528,7 @@ class AgentLoop:
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
+            routing_session_key=route_key,
         )
 
         if not final_content:
@@ -612,11 +648,22 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        routing_session_key: str | None = None,
+        turn_priority: int | None = TURN_PRIORITY_USER,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        return await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress,
-            on_stream=on_stream, on_stream_end=on_stream_end,
-        )
+
+        async def _process() -> OutboundMessage | None:
+            return await self._process_message(
+                msg, session_key=session_key, on_progress=on_progress,
+                on_stream=on_stream, on_stream_end=on_stream_end,
+                routing_session_key=routing_session_key,
+            )
+
+        if turn_priority is None:
+            return await _process()
+        coordination_key = routing_session_key or session_key
+        async with self.session_turn(coordination_key, turn_priority):
+            return await _process()

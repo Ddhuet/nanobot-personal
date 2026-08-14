@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, AsyncContextManager, Callable, Coroutine
 
 from loguru import logger
 
@@ -44,6 +45,11 @@ _PHASE1_SYSTEM_PROMPT = (
 )
 
 
+@asynccontextmanager
+async def _no_decision_guard():
+    yield
+
+
 class HeartbeatService:
     """
     Periodic heartbeat service that wakes the agent to check for tasks.
@@ -68,6 +74,7 @@ class HeartbeatService:
         on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         get_chat_history: Callable[[], tuple[list[dict[str, Any]], str | None, str | None]] | None = None,
+        decision_guard: Callable[[], AsyncContextManager[None]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
         timezone: str | None = None,
@@ -80,6 +87,7 @@ class HeartbeatService:
         self.on_execute = on_execute
         self.on_notify = on_notify
         self.get_chat_history = get_chat_history
+        self.decision_guard = decision_guard
         self.interval_s = interval_s
         self.enabled = enabled
         self.timezone = timezone
@@ -182,6 +190,12 @@ class HeartbeatService:
         args = response.tool_calls[0].arguments
         return args.get("action", "skip"), args.get("tasks", "")
 
+    async def _decide_with_guard(self, content: str) -> tuple[str, str]:
+        """Run phase one behind the same low-priority conversation gate."""
+        guard = self.decision_guard() if self.decision_guard else _no_decision_guard()
+        async with guard:
+            return await self._decide(content)
+
     async def start(self) -> None:
         """Start the heartbeat service."""
         if not self.enabled:
@@ -226,7 +240,7 @@ class HeartbeatService:
         logger.info("Heartbeat: checking for tasks...")
 
         try:
-            action, tasks = await self._decide(content)
+            action, tasks = await self._decide_with_guard(content)
 
             if action != "run":
                 logger.info("Heartbeat: OK (nothing to report)")
@@ -253,7 +267,7 @@ class HeartbeatService:
         content = self._read_heartbeat_file()
         if not content:
             return None
-        action, tasks = await self._decide(content)
+        action, tasks = await self._decide_with_guard(content)
         if action != "run" or not self.on_execute:
             return None
         return await self.on_execute(tasks)

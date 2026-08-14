@@ -1,23 +1,29 @@
 ---
 name: cron
-description: Schedule reminders and recurring tasks.
+description: Schedule exact-time reminders and agent wakeups with one-time, interval, or cron-expression timing.
 ---
 
 # Cron
 
-Use the `cron` tool to schedule reminders or recurring tasks.
+Use the `cron` tool to schedule exact-time reminders or wake the full assistant for a task.
 
-## Three Modes
+At execution time, the assistant receives the current conversation context from the chat that created the job. The saved `message` is an instruction, not text that is delivered directly.
 
-1. **Reminder** - message is sent directly to user
-2. **Task** - message is a task description, agent executes and sends result
-3. **One-time** - runs once at a specific time, then auto-deletes
+The assistant's normal wakeup response is log-only. To show the user anything, call the `message` tool. It is valid to complete a scheduled task without messaging the user.
+
+Use exactly one schedule parameter when adding a job:
+
+- `every_seconds`: positive recurring interval
+- `cron_expr`: recurring calendar schedule; optionally include `tz`
+- `at`: future ISO datetime for one execution
+
+Make `message` a self-contained task instruction. The assistant will also have current conversation history and memory when it runs.
 
 ## Examples
 
-Fixed reminder:
+Fixed reminder wakeup:
 ```
-cron(action="add", message="Time to take a break!", every_seconds=1200)
+cron(action="add", message="Tell the user it is time to take a break by using the message tool.", every_seconds=1200)
 ```
 
 Dynamic task (agent executes each time):
@@ -27,7 +33,7 @@ cron(action="add", message="Check HKUDS/nanobot GitHub stars and report", every_
 
 One-time scheduled task (compute ISO datetime from current time):
 ```
-cron(action="add", message="Remind me about the meeting", at="<ISO datetime>")
+cron(action="add", message="Use the message tool to remind the user about the meeting.", at="<ISO datetime>")
 ```
 
 Timezone-aware cron:
@@ -54,4 +60,6 @@ cron(action="remove", job_id="abc123")
 
 ## Timezone
 
-Use `tz` with `cron_expr` to schedule in a specific IANA timezone. Without `tz`, the server's local timezone is used.
+Use `tz` only with `cron_expr`. Without it, cron expressions and naive ISO datetimes use the configured agent timezone. Prefer an explicit IANA timezone when the user's wording identifies one.
+
+Jobs cannot create new cron jobs while they are executing. They may list or remove existing jobs.

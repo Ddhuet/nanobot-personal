@@ -59,11 +59,27 @@ def _validate_schedule_for_add(schedule: CronSchedule) -> None:
         except Exception:
             raise ValueError(f"unknown timezone '{schedule.tz}'") from None
 
+    now = _now_ms()
+    if schedule.kind == "every":
+        if not schedule.every_ms or schedule.every_ms <= 0:
+            raise ValueError("every_seconds must be greater than 0")
+    elif schedule.kind == "at":
+        if not schedule.at_ms or schedule.at_ms <= now:
+            raise ValueError("at must be a future datetime")
+    elif schedule.kind == "cron":
+        if not schedule.expr or not schedule.expr.strip():
+            raise ValueError("cron_expr must not be empty")
+        if _compute_next_run(schedule, now) is None:
+            raise ValueError(f"invalid cron expression '{schedule.expr}'")
+    else:
+        raise ValueError(f"unknown schedule kind '{schedule.kind}'")
+
 
 class CronService:
     """Service for managing and executing scheduled jobs."""
 
     _MAX_RUN_HISTORY = 20
+    _ERROR_RETRY_DELAY_MS = 60_000
 
     def __init__(
         self,
@@ -109,6 +125,7 @@ class CronService:
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
+                            session_key=j["payload"].get("sessionKey"),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -165,6 +182,7 @@ class CronService:
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
+                        "sessionKey": j.payload.session_key,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -215,7 +233,10 @@ class CronService:
         now = _now_ms()
         for job in self._store.jobs:
             if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                if job.schedule.kind == "at" and job.state.last_status == "error":
+                    job.state.next_run_at_ms = now + self._ERROR_RETRY_DELAY_MS
+                else:
+                    job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -265,6 +286,7 @@ class CronService:
     async def _execute_job(self, job: CronJob) -> None:
         """Execute a single job."""
         start_ms = _now_ms()
+        succeeded = False
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
         try:
@@ -273,6 +295,7 @@ class CronService:
 
             job.state.last_status = "ok"
             job.state.last_error = None
+            succeeded = True
             logger.info("Cron: job '{}' completed", job.name)
 
         except Exception as e:
@@ -294,7 +317,9 @@ class CronService:
 
         # Handle one-shot jobs
         if job.schedule.kind == "at":
-            if job.delete_after_run:
+            if not succeeded:
+                job.state.next_run_at_ms = _now_ms() + self._ERROR_RETRY_DELAY_MS
+            elif job.delete_after_run:
                 self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
             else:
                 job.enabled = False
@@ -319,6 +344,7 @@ class CronService:
         deliver: bool = False,
         channel: str | None = None,
         to: str | None = None,
+        session_key: str | None = None,
         delete_after_run: bool = False,
     ) -> CronJob:
         """Add a new job."""
@@ -337,6 +363,7 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
+                session_key=session_key,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
