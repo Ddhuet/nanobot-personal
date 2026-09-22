@@ -287,7 +287,21 @@ class _FakeWakeupAgent:
         self.tools.register(message_tool)
         self.coordinator = SessionTurnCoordinator()
         self.seen_history: list[dict] = []
+        self.seen_last_consolidated = 0
         self.seen_instruction = ""
+
+        class _Consolidator:
+            def __init__(consolidator_self) -> None:
+                consolidator_self.calls: list[str] = []
+
+            async def maybe_consolidate_by_tokens(consolidator_self, session) -> None:
+                consolidator_self.calls.append(session.key)
+                if session.messages:
+                    session.last_consolidated = 1
+                    session.consolidation_threshold_exceeded = True
+                    sessions.save(session)
+
+        self.memory_consolidator = _Consolidator()
 
     def session_turn(self, session_key: str, priority: int):
         return self.coordinator.turn(session_key, priority)
@@ -295,6 +309,7 @@ class _FakeWakeupAgent:
     async def process_direct(self, content: str, **kwargs) -> OutboundMessage:
         scratch = self.sessions.get_or_create(kwargs["session_key"])
         self.seen_history = [dict(message) for message in scratch.messages]
+        self.seen_last_consolidated = scratch.last_consolidated
         self.seen_instruction = content
         message_tool = self.tools.get("message")
         assert isinstance(message_tool, MessageTool)
@@ -341,6 +356,10 @@ class SilentWakeupTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(plain, "plain output that must remain log-only")
             self.assertEqual(agent.seen_history[-1]["content"], "new answer before cron")
+            self.assertEqual(agent.seen_last_consolidated, 1)
+            scratch = sessions.get_or_create("cron:abcd1234")
+            self.assertTrue(scratch.consolidation_threshold_exceeded)
+            self.assertEqual(agent.memory_consolidator.calls, ["telegram:123"])
             self.assertEqual(agent.seen_instruction, "instruction after wait")
             self.assertEqual([message.content for message in outbound], ["background update"])
 

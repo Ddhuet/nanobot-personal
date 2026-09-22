@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
+from nanobot.utils.helpers import ensure_dir, estimate_prompt_tokens_chain
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -222,8 +222,6 @@ class MemoryStore:
 class MemoryConsolidator:
     """Owns consolidation policy, locking, and session offset updates."""
 
-    _MAX_CONSOLIDATION_ROUNDS = 5
-
     _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
 
     def __init__(
@@ -233,6 +231,7 @@ class MemoryConsolidator:
         model: str,
         sessions: SessionManager,
         context_window_tokens: int,
+        keep_messages: int,
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
@@ -242,6 +241,7 @@ class MemoryConsolidator:
         self.model = model
         self.sessions = sessions
         self.context_window_tokens = context_window_tokens
+        self.keep_messages = max(1, keep_messages)
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
@@ -255,27 +255,17 @@ class MemoryConsolidator:
         """Archive a selected message chunk into persistent memory."""
         return await self.store.consolidate(messages, self.provider, self.model)
 
-    def pick_consolidation_boundary(
-        self,
-        session: Session,
-        tokens_to_remove: int,
-    ) -> tuple[int, int] | None:
-        """Pick a user-turn boundary that removes enough old prompt tokens."""
+    def pick_consolidation_boundary(self, session: Session) -> int | None:
+        """Pick a user-turn boundary retaining at least the newest configured messages."""
         start = session.last_consolidated
-        if start >= len(session.messages) or tokens_to_remove <= 0:
+        active_count = len(session.messages) - start
+        if active_count <= self.keep_messages:
             return None
 
-        removed_tokens = 0
-        last_boundary: tuple[int, int] | None = None
-        for idx in range(start, len(session.messages)):
-            message = session.messages[idx]
-            if idx > start and message.get("role") == "user":
-                last_boundary = (idx, removed_tokens)
-                if removed_tokens >= tokens_to_remove:
-                    return last_boundary
-            removed_tokens += estimate_message_tokens(message)
-
-        return last_boundary
+        boundary = len(session.messages) - self.keep_messages
+        while boundary > start and session.messages[boundary].get("role") != "user":
+            boundary -= 1
+        return boundary if boundary > start else None
 
     def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
@@ -304,10 +294,11 @@ class MemoryConsolidator:
         return True
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
-        """Loop: archive old messages until prompt fits within safe budget.
+        """Archive old messages once after the prompt crosses the safe budget.
 
         The budget reserves space for completion tokens and a safety buffer
-        so the LLM request never exceeds the context window.
+        before triggering consolidation. A successful pass retains at least
+        ``keep_messages`` recent messages, aligned to a user-turn boundary.
         """
         if not session.messages or self.context_window_tokens <= 0:
             return
@@ -315,11 +306,13 @@ class MemoryConsolidator:
         lock = self.get_lock(session.key)
         async with lock:
             budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
-            target = budget // 2
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
             if estimated < budget:
+                if session.consolidation_threshold_exceeded:
+                    session.consolidation_threshold_exceeded = False
+                    self.sessions.save(session)
                 logger.debug(
                     "Token consolidation idle {}: {}/{} via {}",
                     session.key,
@@ -328,39 +321,42 @@ class MemoryConsolidator:
                     source,
                 )
                 return
-
-            for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
-                if estimated <= target:
-                    return
-
-                boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
-                if boundary is None:
-                    logger.debug(
-                        "Token consolidation: no safe boundary for {} (round {})",
-                        session.key,
-                        round_num,
-                    )
-                    return
-
-                end_idx = boundary[0]
-                chunk = session.messages[session.last_consolidated:end_idx]
-                if not chunk:
-                    return
-
-                logger.info(
-                    "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
-                    round_num,
+            if session.consolidation_threshold_exceeded:
+                logger.debug(
+                    "Token consolidation already handled for current threshold crossing: {}",
                     session.key,
-                    estimated,
-                    self.context_window_tokens,
-                    source,
-                    len(chunk),
                 )
-                if not await self.consolidate_messages(chunk):
-                    return
-                session.last_consolidated = end_idx
-                self.sessions.save(session)
+                return
 
-                estimated, source = self.estimate_session_prompt_tokens(session)
-                if estimated <= 0:
-                    return
+            boundary = self.pick_consolidation_boundary(session)
+            if boundary is None:
+                session.consolidation_threshold_exceeded = True
+                self.sessions.save(session)
+                logger.debug(
+                    "Token consolidation: no safe boundary for {} (keeping at least {} msgs)",
+                    session.key,
+                    self.keep_messages,
+                )
+                return
+
+            chunk = session.messages[session.last_consolidated:boundary]
+            if not chunk:
+                return
+
+            logger.info(
+                "Token consolidation for {}: {}/{} via {}, chunk={} msgs, keeping={} msgs",
+                session.key,
+                estimated,
+                self.context_window_tokens,
+                source,
+                len(chunk),
+                len(session.messages) - boundary,
+            )
+            if not await self.consolidate_messages(chunk):
+                return
+            session.last_consolidated = boundary
+            post_estimated, _ = self.estimate_session_prompt_tokens(session)
+            session.consolidation_threshold_exceeded = (
+                post_estimated <= 0 or post_estimated >= budget
+            )
+            self.sessions.save(session)

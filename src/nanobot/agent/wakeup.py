@@ -44,8 +44,12 @@ async def execute_silent_wakeup(
 
         if chat_session_key:
             chat_session = agent.sessions.get_or_create(chat_session_key)
+            await agent.memory_consolidator.maybe_consolidate_by_tokens(chat_session)
             scratch.messages = [dict(message) for message in chat_session.messages]
             scratch.last_consolidated = chat_session.last_consolidated
+            scratch.consolidation_threshold_exceeded = (
+                chat_session.consolidation_threshold_exceeded
+            )
             logger.debug(
                 "Wakeup {}: seeded {} messages from {}",
                 scratch_session_key,
