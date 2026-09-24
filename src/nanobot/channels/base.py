@@ -34,6 +34,10 @@ class BaseChannel(ABC):
         """
         self.config = config
         self.bus = bus
+        # ChannelManager injects the configured agent workspace after channel
+        # construction.  Keeping this optional preserves the two-argument
+        # constructor used by built-in and external channel implementations.
+        self.workspace: Path | None = None
         self._running = False
 
     async def transcribe_audio(self, file_path: str | Path) -> str:

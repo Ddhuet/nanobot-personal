@@ -13,7 +13,7 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.paths import get_media_dir
+from nanobot.config.paths import get_workspace_path
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import split_message
 
@@ -309,7 +309,12 @@ class DiscordChannel(BaseChannel):
 
         content_parts = [content] if content else []
         media_paths: list[str] = []
-        media_dir = get_media_dir("discord")
+        # Inbound attachments must live inside the agent workspace so they
+        # remain readable when filesystem tools are restricted to it.  The
+        # manager supplies custom workspace configuration; the fallback keeps
+        # direct/test construction aligned with the default workspace.
+        workspace = (self.workspace or get_workspace_path()).expanduser().resolve()
+        media_dir = workspace / "media" / "discord"
 
         for attachment in payload.get("attachments") or []:
             url = attachment.get("url")
