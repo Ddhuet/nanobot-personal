@@ -75,9 +75,18 @@ class HeartbeatDecisionGuardTests(unittest.IsolatedAsyncioTestCase):
         guard_active = False
 
         class _Provider:
-            async def chat_with_retry(provider_self, **_kwargs) -> LLMResponse:
+            async def chat_with_retry(provider_self, **kwargs) -> LLMResponse:
                 self.assertTrue(guard_active)
-                return LLMResponse(content="")
+                self.assertIsNone(kwargs["reasoning_effort"])
+                return LLMResponse(
+                    content="",
+                    tool_calls=[ToolCallRequest(
+                        id="heartbeat-decision",
+                        name="heartbeat",
+                        arguments={"action": "skip"},
+                    )],
+                    finish_reason="tool_calls",
+                )
 
         @asynccontextmanager
         async def guard():
@@ -102,6 +111,70 @@ class HeartbeatDecisionGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((action, tasks), ("skip", ""))
         self.assertFalse(guard_active)
+
+    async def test_phase_one_provider_error_is_not_reported_as_skip(self) -> None:
+        class _Provider:
+            async def chat_with_retry(provider_self, **_kwargs) -> LLMResponse:
+                return LLMResponse(
+                    content="request timed out",
+                    tool_calls=[ToolCallRequest(
+                        id="heartbeat-decision",
+                        name="heartbeat",
+                        arguments={"action": "skip"},
+                    )],
+                    finish_reason="error",
+                )
+
+        provider = _Provider()
+        heartbeat = HeartbeatService(
+            workspace=Path("/__nanobot_nonexistent_test_workspace__"),
+            provider=provider,  # type: ignore[arg-type]
+            model="test",
+            decide_provider=provider,  # type: ignore[arg-type]
+            decide_model="test",
+        )
+        with self.assertRaisesRegex(RuntimeError, "error response: request timed out"):
+            await heartbeat._decide("task")
+
+    async def test_phase_one_missing_tool_call_is_not_reported_as_skip(self) -> None:
+        class _Provider:
+            async def chat_with_retry(provider_self, **_kwargs) -> LLMResponse:
+                return LLMResponse(content="", finish_reason="stop")
+
+        provider = _Provider()
+        heartbeat = HeartbeatService(
+            workspace=Path("/__nanobot_nonexistent_test_workspace__"),
+            provider=provider,  # type: ignore[arg-type]
+            model="test",
+            decide_provider=provider,  # type: ignore[arg-type]
+            decide_model="test",
+        )
+        with self.assertRaisesRegex(RuntimeError, "no heartbeat tool call"):
+            await heartbeat._decide("task")
+
+    async def test_phase_one_rejects_invalid_tool_decision(self) -> None:
+        class _Provider:
+            async def chat_with_retry(provider_self, **_kwargs) -> LLMResponse:
+                return LLMResponse(
+                    content="",
+                    tool_calls=[ToolCallRequest(
+                        id="heartbeat-decision",
+                        name="heartbeat",
+                        arguments={"action": "maybe"},
+                    )],
+                    finish_reason="tool_calls",
+                )
+
+        provider = _Provider()
+        heartbeat = HeartbeatService(
+            workspace=Path("/__nanobot_nonexistent_test_workspace__"),
+            provider=provider,  # type: ignore[arg-type]
+            model="test",
+            decide_provider=provider,  # type: ignore[arg-type]
+            decide_model="test",
+        )
+        with self.assertRaisesRegex(RuntimeError, "invalid action"):
+            await heartbeat._decide("task")
 
 
 class CronToolValidationTests(unittest.IsolatedAsyncioTestCase):

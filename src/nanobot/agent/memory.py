@@ -116,6 +116,7 @@ class MemoryStore:
         messages: list[dict],
         provider: LLMProvider,
         model: str,
+        is_current: Callable[[], bool] | None = None,
     ) -> bool:
         """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
         if not messages:
@@ -147,6 +148,9 @@ class MemoryStore:
             if response.finish_reason == "error" and _is_tool_choice_unsupported(
                 response.content
             ):
+                if is_current is not None and not is_current():
+                    logger.info("Discarding stale memory consolidation result")
+                    return False
                 logger.warning("Forced tool_choice unsupported, retrying with auto")
                 response = await provider.chat_with_retry(
                     messages=chat_messages,
@@ -154,6 +158,12 @@ class MemoryStore:
                     model=model,
                     tool_choice="auto",
                 )
+
+            # A /new command can reset the session while the provider is
+            # working. Do not let the old snapshot write memory after reset.
+            if is_current is not None and not is_current():
+                logger.info("Discarding stale memory consolidation result")
+                return False
 
             if not response.has_tool_calls:
                 logger.warning(
@@ -196,6 +206,9 @@ class MemoryStore:
             return True
         except Exception:
             logger.exception("Memory consolidation failed")
+            if is_current is not None and not is_current():
+                logger.info("Discarding stale failed memory consolidation")
+                return False
             return self._fail_or_raw_archive(messages)
 
     def _fail_or_raw_archive(self, messages: list[dict]) -> bool:
@@ -251,9 +264,15 @@ class MemoryConsolidator:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
 
-    async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
+    async def consolidate_messages(
+        self,
+        messages: list[dict[str, object]],
+        is_current: Callable[[], bool] | None = None,
+    ) -> bool:
         """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(messages, self.provider, self.model)
+        return await self.store.consolidate(
+            messages, self.provider, self.model, is_current=is_current
+        )
 
     def pick_consolidation_boundary(self, session: Session) -> int | None:
         """Pick a user-turn boundary retaining at least the newest configured messages."""
@@ -342,6 +361,8 @@ class MemoryConsolidator:
             chunk = session.messages[session.last_consolidated:boundary]
             if not chunk:
                 return
+            generation = session.consolidation_generation
+            is_current = lambda: session.consolidation_generation == generation
 
             logger.info(
                 "Token consolidation for {}: {}/{} via {}, chunk={} msgs, keeping={} msgs",
@@ -352,7 +373,11 @@ class MemoryConsolidator:
                 len(chunk),
                 len(session.messages) - boundary,
             )
-            if not await self.consolidate_messages(chunk):
+            if not await self.consolidate_messages(chunk, is_current=is_current):
+                return
+            # Defensive check: the guard above is checked just before memory
+            # writes; keep session offsets protected if that contract changes.
+            if not is_current():
                 return
             session.last_consolidated = boundary
             post_estimated, _ = self.estimate_session_prompt_tokens(session)

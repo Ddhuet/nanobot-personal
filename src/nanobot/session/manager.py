@@ -32,6 +32,7 @@ class Session:
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
     consolidation_threshold_exceeded: bool = False
+    consolidation_generation: int = field(default=0, repr=False, compare=False)
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -95,6 +96,9 @@ class Session:
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
+        # Invalidate any consolidation currently awaiting an LLM response. It
+        # may still finish, but must not commit its stale snapshot or cursor.
+        self.consolidation_generation += 1
         self.messages = []
         self.last_consolidated = 0
         self.consolidation_threshold_exceeded = False
@@ -209,6 +213,20 @@ class SessionManager:
                         )
                     else:
                         messages.append(data)
+
+            # A stale background consolidation could previously save a
+            # cursor from an old, longer session after /new had cleared it.
+            # Such an offset is impossible for a valid session and would hide
+            # all its messages from future prompts.
+            if last_consolidated > len(messages):
+                logger.warning(
+                    "Resetting invalid consolidation cursor for {}: {} > {} messages",
+                    key,
+                    last_consolidated,
+                    len(messages),
+                )
+                last_consolidated = 0
+                consolidation_threshold_exceeded = False
 
             return Session(
                 key=key,

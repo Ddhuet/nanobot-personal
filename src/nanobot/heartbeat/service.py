@@ -182,13 +182,38 @@ class HeartbeatService:
             messages=messages,
             tools=_HEARTBEAT_TOOL,
             model=self.decide_model,
+            # A dedicated heartbeat model/preset may define its own reasoning
+            # settings. Do not inherit the main agent's reasoning_effort and
+            # send a conflicting override to the provider.
+            reasoning_effort=None,
         )
 
+        if response.finish_reason == "error":
+            detail = (response.content or "unknown provider error").strip()[:500]
+            raise RuntimeError(
+                f"Heartbeat decision provider returned an error response: {detail}"
+            )
         if not response.has_tool_calls:
-            return "skip", ""
+            raise RuntimeError(
+                "Heartbeat decision provider returned no heartbeat tool call "
+                f"(finish_reason={response.finish_reason!r})"
+            )
 
-        args = response.tool_calls[0].arguments
-        return args.get("action", "skip"), args.get("tasks", "")
+        tool_call = response.tool_calls[0]
+        if tool_call.name != "heartbeat":
+            raise RuntimeError(f"Heartbeat decision returned unexpected tool {tool_call.name!r}")
+        args = tool_call.arguments
+        if not isinstance(args, dict):
+            raise RuntimeError("Heartbeat decision returned invalid tool arguments")
+        action = args.get("action")
+        if action not in ("skip", "run"):
+            raise RuntimeError(f"Heartbeat decision returned invalid action {action!r}")
+        tasks = args.get("tasks", "")
+        if not isinstance(tasks, str):
+            raise RuntimeError("Heartbeat decision returned non-text tasks")
+        if action == "run" and not tasks.strip():
+            raise RuntimeError("Heartbeat decision requested run without describing any tasks")
+        return action, tasks
 
     async def _decide_with_guard(self, content: str) -> tuple[str, str]:
         """Run phase one behind the same low-priority conversation gate."""
