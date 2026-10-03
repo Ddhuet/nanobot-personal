@@ -6,9 +6,9 @@ from argparse import Namespace
 from pathlib import Path
 
 import pytest
-from scripts.migrate_personal_state import migrate
 
 from scripts import personal_upgrade as upgrade
+from scripts.migrate_personal_state import migrate
 
 
 def instance(tmp_path):
