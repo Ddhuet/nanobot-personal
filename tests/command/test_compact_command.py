@@ -75,7 +75,7 @@ async def test_compact_emits_one_lifecycle_and_keeps_the_session(loop, command) 
     loop.sessions.invalidate("cli:test")
     reloaded = loop.sessions.get_or_create("cli:test")
     assert reloaded.provider_state is None
-    assert reloaded.messages[:-1] == session.messages
+    assert reloaded.messages == session.messages
     assert is_hidden_history_message(reloaded.messages[-1])
     assert reloaded.last_archived == 2
     assert [m["content"] for m in reloaded.get_history()] == [SUMMARY_CONTINUATION_TEXT]

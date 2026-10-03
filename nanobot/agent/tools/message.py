@@ -17,6 +17,7 @@ from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameter
 from nanobot.bus.events import OutboundMessage
 from nanobot.config.paths import get_workspace_path
 from nanobot.security.workspace_access import current_tool_workspace
+from nanobot.session.manager import SessionManager
 
 _CURRENT_MESSAGE_SENDS: ContextVar[set[tuple[str, str]] | None] = ContextVar(
     "message_sends",
@@ -39,7 +40,8 @@ def capture_message_deliveries() -> Generator[set[tuple[str, str]], None, None]:
     tool_parameters_schema(
         content=StringSchema(
             "Message content for proactive or cross-channel delivery. "
-            "Do not use this for a normal reply in the current chat."
+            "Always use this for user-visible cron output; scheduled final answers stay internal. "
+            "Do not use this for a normal reply in the current chat; immediate user replies are sent automatically."
         ),
         channel=StringSchema(
             "Optional target channel for cross-channel/proactive delivery. "
@@ -76,8 +78,10 @@ class MessageTool(Tool):
         default_message_id: str | None = None,
         workspace: str | Path | None = None,
         restrict_to_workspace: bool = False,
+        sessions: SessionManager | None = None,
     ):
         self._send_callback = send_callback
+        self._sessions = sessions
         self._workspace = (
             Path(workspace).expanduser() if workspace is not None else get_workspace_path()
         )
@@ -98,6 +102,7 @@ class MessageTool(Tool):
             send_callback=send_callback,
             workspace=ctx.workspace,
             restrict_to_workspace=ctx.config.restrict_to_workspace,
+            sessions=ctx.sessions,
         )
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
@@ -120,9 +125,11 @@ class MessageTool(Tool):
     def description(self) -> str:
         return (
             "Proactively send a message to a user/channel, optionally with file attachments. "
+            "For every cron run, this is the only way to deliver user-visible output, including "
+            "to the current runtime destination. Scheduled final answers stay internal. "
             "Use this for reminders, cross-channel delivery, or explicit proactive sends. "
             "Do not use this for the normal reply in the current chat: answer naturally instead. "
-            "If channel/chat_id would target the current runtime conversation, do not call this tool "
+            "For an immediate user turn, if channel/chat_id would target the current runtime conversation, do not call this tool "
             "unless the user explicitly asked you to proactively send an existing file attachment. "
             "When generate_image creates images in the current chat, use the message tool "
             "with the artifact paths in the media parameter to deliver the images to the user. "
@@ -158,9 +165,9 @@ class MessageTool(Tool):
         buttons: Any = None,
         **kwargs: Any,
     ) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]
-        from nanobot.utils.helpers import strip_think
+        from nanobot.utils.helpers import strip_leading_timestamp, strip_think
 
-        content = strip_think(content)
+        content = strip_leading_timestamp(strip_think(content)) or ""
 
         button_rows: list[list[str]] | None = None
         if buttons is not None:
@@ -231,7 +238,9 @@ class MessageTool(Tool):
         metadata = dict(default_metadata) if same_target else {}
         if message_id:
             metadata["message_id"] = message_id
-        if media:
+        delivery_key = metadata.pop("_message_default_session_key", None)
+        metadata.pop("_record_channel_delivery", None)
+        if media and self._sessions is None:
             metadata["_record_channel_delivery"] = True
 
         msg = OutboundMessage(
@@ -249,6 +258,18 @@ class MessageTool(Tool):
 
         try:
             await self._send_callback(msg)
+            if self._sessions is not None:
+                key = (
+                    delivery_key if same_target and isinstance(delivery_key, str)
+                    else request_ctx.session_key if same_target and request_ctx and request_ctx.session_key
+                    else f"{channel}:{chat_id}"
+                )
+                session = self._sessions.get_or_create(key)
+                extra: dict[str, Any] = {"_channel_delivery": True}
+                if media:
+                    extra["media"] = list(media)
+                session.add_message("assistant", content, **extra)
+                self._sessions.save(session)
             sends = _CURRENT_MESSAGE_SENDS.get()
             if sends is not None:
                 sends.add((channel, chat_id))

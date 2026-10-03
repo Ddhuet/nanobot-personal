@@ -10,6 +10,11 @@ from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
 
 
+@pytest.fixture(autouse=True)
+def stable_clock(monkeypatch):
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: 1_735_689_600_000)
+
+
 def _make_tool(tmp_path) -> CronTool:
     service = CronService(tmp_path / "cron" / "jobs.json")
     return CronTool(service)
@@ -436,7 +441,7 @@ def test_add_job_captures_owner_and_origin_without_legacy_delivery_fields(tmp_pa
     assert jobs[0].payload.channel_meta == {}
 
 
-def test_list_excludes_disabled_jobs(tmp_path) -> None:
+def test_list_includes_disabled_jobs_for_editing(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     job = tool._cron.add_job(
         name="Paused job",
@@ -446,5 +451,5 @@ def test_list_excludes_disabled_jobs(tmp_path) -> None:
     tool._cron.enable_job(job.id, enabled=False)
 
     result = tool._list_jobs()
-    assert "Paused job" not in result
-    assert result == "No scheduled jobs."
+    assert "Paused job" in result
+    assert "Enabled: False" in result

@@ -72,6 +72,7 @@
 
 ## Scheduling and Background Work
 
+- Every cron run must use `message` for user-visible output; final answers stay internal.
 - Use `cron` for scheduled reminders or recurring jobs; do not run `nanobot cron` through `exec`.
 - For heartbeat tasks, update `HEARTBEAT.md`; the default gateway heartbeat cron job handles periodic checks when enabled.
 - Do not write reminders only to memory files when the user expects an actual notification.

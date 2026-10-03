@@ -933,6 +933,8 @@ class AgentLoop:
         if automation_metadata:
             return
         delivery.remember_session_route(session.metadata)
+        if msg.sender_id != "cron" and not msg.metadata.get("_cron_silent"):
+            session.metadata["_last_user_activity"] = datetime.now().isoformat()
         if self._unified_session and session.key == UNIFIED_SESSION_KEY:
             remember_last_channel(session.metadata, msg.channel, msg.chat_id)
 
@@ -1121,7 +1123,7 @@ class AgentLoop:
             self.context.build_transcript,
             channel=request_ctx.channel,
             workspace=effective_scope.project_path,
-            include_memory=session.policy.persist if session is not None else True,
+            include_memory=(session.policy.persist or bool(request_metadata.get("_cron_history_session"))) if session is not None else True,
         )
         if request_context is None:
             request_ctx = dataclasses.replace(
@@ -1765,6 +1767,8 @@ class AgentLoop:
             else:
                 ctx.session = self.sessions.get_or_create(ctx.session_key)
         session = ctx.session
+        if msg.metadata.get("_cron_ephemeral"):
+            session.policy = dataclasses.replace(session.policy, persist=False)
         ctx.ephemeral = ctx.ephemeral or not session.policy.persist
         tools = ctx.tools or self.tools
         if session.policy.disabled_tools:
@@ -1884,7 +1888,16 @@ class AgentLoop:
             session = ctx.require_session()
         is_subagent = ctx.kind is TurnKind.SYSTEM and ctx.msg.sender_id == "subagent"
 
-        ctx.history = session.get_history(extend_to_user=is_subagent)
+        ctx.history = session.get_history(extend_to_user=is_subagent, include_timestamps=True)
+        history_key = ctx.msg.metadata.get("_cron_history_session")
+        if isinstance(history_key, str):
+            source = self.sessions.get_or_create(history_key)
+            ctx.history = source.get_history(include_timestamps=True)
+            from nanobot.session.summary import session_summary_from_metadata
+
+            ctx.pending_summary = session_summary_from_metadata(
+                source.metadata, fallback_last_active=source.updated_at,
+            )
         stored_state = session.provider_state
         subagent_followup_persisted = False
         if is_subagent:
@@ -2084,7 +2097,7 @@ class AgentLoop:
             log_content=ctx.require_session().policy.log_content,
             turn_latency_ms=ctx.turn_latency_ms,
         )
-        if ctx.ephemeral and ctx.outbound is not None:
+        if (ctx.ephemeral or ctx.msg.metadata.get("_cron_silent")) and ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
 
     def _sanitize_persisted_blocks(
@@ -2247,6 +2260,15 @@ class AgentLoop:
                     entry["content"] = filtered
                 if isinstance(runtime_context_meta, dict):
                     entry[RUNTIME_CONTEXT_HISTORY_META] = runtime_context_meta
+            if role == "assistant":
+                from nanobot.utils.helpers import strip_leading_timestamp
+
+                assistant_content = entry.get("content")
+                assistant_reasoning = entry.get("reasoning_content")
+                if isinstance(assistant_content, str):
+                    entry["content"] = strip_leading_timestamp(assistant_content)
+                if isinstance(assistant_reasoning, str):
+                    entry["reasoning_content"] = strip_leading_timestamp(assistant_reasoning)
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
             if role == "user":
@@ -2335,11 +2357,12 @@ class AgentLoop:
         runtime: LLMRuntime | None = None,
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
         attributes: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process an external message directly and return the outbound payload."""
         if channel == "system":
             raise ValueError("channel 'system' is reserved for internal messages")
-        metadata: dict[str, Any] = {}
+        metadata = dict(metadata or {})
         if not persist_user_message:
             metadata[turn_continuation.SKIP_USER_PERSIST_META] = True
         msg = InboundMessage(
@@ -2371,12 +2394,17 @@ class AgentLoop:
                     kwargs["on_runtime_admitted"] = on_runtime_admitted
                 if attributes is not None:
                     kwargs["attributes"] = dict(attributes)
+                if metadata.get("_cron_silent"):
+                    delivery = self.turn_delivery_factory.unrouted(msg, session_key)
+                    delivery.events = EventSink()
+                    kwargs["delivery"] = delivery
                 return await self._process_message(
                     msg,
                     **kwargs,
                 )
         finally:
-            await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")
+            if not metadata.get("_cron_silent") and not session_key.startswith("cron:"):
+                await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")
             self.runtime_event_publisher.clear_turn(session_key)
 
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
@@ -2386,3 +2414,7 @@ class AgentLoop:
             lock = asyncio.Lock()
             self._session_locks[session_key] = lock
         return lock
+
+    def session_lock(self, session_key: str) -> asyncio.Lock:
+        """Share ordinary turn serialization with a caller reading that session's context."""
+        return self._get_session_lock(session_key)

@@ -1111,35 +1111,40 @@ class Consolidator:
         provider_state: ProviderConversationState | None = None,
     ) -> str | None:
         """Summarize the exact transcript prefix already accepted by the model."""
-        source_messages = [
-            dict(message)
-            for message in accepted_messages
-            if message.get("role") != "system"
-        ]
-        if not source_messages:
+        lock = self.get_lock(session_key)
+        if lock.locked():
+            logger.debug("Compaction already active for {}; ignoring duplicate", session_key)
             return None
+        async with lock:
+            source_messages = [
+                dict(message)
+                for message in accepted_messages
+                if message.get("role") != "system"
+            ]
+            if not source_messages:
+                return None
 
-        max_output_tokens = max(0, runtime.generation.max_tokens)
-        input_token_budget = runtime.context_window_tokens - max_output_tokens
-        checkpoint_tokens = min(
-            max_output_tokens,
-            max(1, (input_token_budget - self._SAFETY_BUFFER) // 2),
-        )
+            max_output_tokens = max(0, runtime.generation.max_tokens)
+            input_token_budget = runtime.context_window_tokens - max_output_tokens
+            checkpoint_tokens = min(
+                max_output_tokens,
+                max(1, (input_token_budget - self._SAFETY_BUFFER) // 2),
+            )
 
-        summary = await self.archiver.archive(
-            source_messages,
-            runtime=runtime,
-            session_key=session_key,
-            history=accepted_messages,
-            request_tools=tools,
-            previous_summary=previous_summary,
-            input_token_budget=input_token_budget,
-            fallback_max_tokens=max(1, checkpoint_tokens),
-            provider_state=provider_state,
-        )
-        if summary is None:
-            return None
-        return truncate_text_to_tokens(summary, max(1, max_output_tokens))
+            summary = await self.archiver.archive(
+                source_messages,
+                runtime=runtime,
+                session_key=session_key,
+                history=accepted_messages,
+                request_tools=tools,
+                previous_summary=previous_summary,
+                input_token_budget=input_token_budget,
+                fallback_max_tokens=max(1, checkpoint_tokens),
+                provider_state=provider_state,
+            )
+            if summary is None:
+                return None
+            return truncate_text_to_tokens(summary, max(1, max_output_tokens))
 
     async def summarize_provider_compaction(
         self,
@@ -1233,9 +1238,12 @@ class Consolidator:
         archived messages. All compaction triggers share checkpoint replay.
         """
         lock = self.get_lock(session_key)
+        if lock.locked():
+            logger.debug("Compaction already active for {}; ignoring duplicate", session_key)
+            return ""
         async with lock:
-            self.sessions.invalidate(session_key)
             session = self.sessions.get_or_create(session_key)
+            reset_generation = session.reset_generation
 
             archive_start = session.last_archived
             messages_to_archive = list(session.messages[archive_start:])
@@ -1256,6 +1264,13 @@ class Consolidator:
                 summary = await self.archive_session(
                     session, archive_end=archive_end, runtime=runtime,
                 )
+                if (
+                    session.reset_generation != reset_generation
+                    or self.sessions.get_cached(session_key) is not session
+                ):
+                    await events.emit(ContextCompactionEvent(compaction_id=compaction_id, phase="cancelled"))
+                    logger.debug("Discarding stale compaction after reset/replacement: {}", session_key)
+                    return ""
                 if summary:
                     # Concurrent appends remain after the captured boundary.
                     session.commit_summary_checkpoint(

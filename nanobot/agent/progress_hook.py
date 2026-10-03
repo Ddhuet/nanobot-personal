@@ -11,7 +11,7 @@ from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.bus.outbound_events import ProgressEvent, StreamDeltaEvent, StreamEndEvent
 from nanobot.events import NO_EVENTS, EventSink
 from nanobot.providers.base import ToolCallRequest
-from nanobot.utils.helpers import IncrementalThinkExtractor, strip_think
+from nanobot.utils.helpers import IncrementalThinkExtractor, strip_leading_timestamp, strip_think
 from nanobot.utils.progress_events import (
     build_tool_event_finish_payloads,
     build_tool_event_start_payload,
@@ -36,6 +36,8 @@ class AgentProgressHook(AgentHook):
         self._session_key = session_key
         self._tool_hint_max_length = tool_hint_max_length
         self._stream_buf = ""
+        self._reasoning_buf = ""
+        self._reasoning_visible = ""
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
 
@@ -46,15 +48,27 @@ class AgentProgressHook(AgentHook):
     def _strip_think(text: str | None) -> str | None:
         if not text:
             return None
-        return strip_think(text) or None
+        return strip_leading_timestamp(strip_think(text)) or None
 
     def _tool_hint(self, tool_calls: list[Any]) -> str:
         return format_tool_hints(tool_calls, max_length=self._tool_hint_max_length)
 
+    @staticmethod
+    def _visible_prefix(text: str, *, final: bool = False) -> str:
+        """Hold a possible copied timestamp until its prefix can be classified."""
+        candidate = text.lstrip(" \t\r\n\u200b\ufeff")
+        pattern = "[0000-00-00 00:00]"
+        if not final and len(candidate) <= len(pattern) and all(
+            char in "0123456789" if expected == "0" else char == expected
+            for char, expected in zip(candidate, pattern)
+        ):
+            return ""
+        return strip_leading_timestamp(text) or ""
+
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-        prev_clean = strip_think(self._stream_buf)
+        prev_clean = self._visible_prefix(strip_think(self._stream_buf))
         self._stream_buf += delta
-        new_clean = strip_think(self._stream_buf)
+        new_clean = self._visible_prefix(strip_think(self._stream_buf))
         incremental = new_clean[len(prev_clean) :]
 
         if await self._think_extractor.feed(self._stream_buf, self.emit_reasoning):
@@ -68,6 +82,10 @@ class AgentProgressHook(AgentHook):
                 await self._publish(StreamDeltaEvent(content=incremental))
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+        visible = self._visible_prefix(strip_think(self._stream_buf), final=True)
+        already_sent = self._visible_prefix(strip_think(self._stream_buf))
+        if self._publish and self._streaming and len(visible) > len(already_sent):
+            await self._publish(StreamDeltaEvent(content=visible[len(already_sent):]))
         await self.emit_reasoning_end()
         if self._publish and self._streaming:
             await self._publish(StreamEndEvent(
@@ -147,11 +165,22 @@ class AgentProgressHook(AgentHook):
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         """Publish a reasoning chunk; channel plugins decide whether to render."""
         if self._publish and reasoning_content:
-            self._reasoning_open = True
-            await self._publish(ProgressEvent(content=reasoning_content, reasoning_delta=True))
+            self._reasoning_buf += reasoning_content
+            visible = self._visible_prefix(self._reasoning_buf)
+            delta = visible[len(self._reasoning_visible):]
+            self._reasoning_visible = visible
+            if delta:
+                self._reasoning_open = True
+                await self._publish(ProgressEvent(content=delta, reasoning_delta=True))
 
     async def emit_reasoning_end(self) -> None:
         """Close the current reasoning stream segment, if any was open."""
+        visible = self._visible_prefix(self._reasoning_buf, final=True)
+        delta = visible[len(self._reasoning_visible):]
+        if delta and self._publish:
+            self._reasoning_open = True
+            await self._publish(ProgressEvent(content=delta, reasoning_delta=True))
+        self._reasoning_buf = self._reasoning_visible = ""
         if self._reasoning_open and self._publish:
             self._reasoning_open = False
             await self._publish(ProgressEvent(reasoning_end=True))

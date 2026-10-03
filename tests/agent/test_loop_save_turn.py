@@ -2347,7 +2347,7 @@ async def test_turn_after_unanswered_user_keeps_tool_call_pairing(tmp_path: Path
     async def fake_run_agent_loop(transcript_input, **_kwargs):
         initial_messages = _assembled_messages(loop.context, transcript_input)
         assert [m["role"] for m in initial_messages] == ["system", "user", "user"]
-        assert initial_messages[-2]["content"] == "earlier question that never got an answer"
+        assert initial_messages[-2]["content"].endswith("earlier question that never got an answer")
         assert initial_messages[-1]["content"] == "and another thing"
         return _agent_run_result(
             "done",

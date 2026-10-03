@@ -1113,7 +1113,8 @@ class TestCompactIdleSession:
         assert entries[0]["content"].startswith("[RAW] 20 messages")
 
         reloaded = sessions.get_or_create("cli:fail")
-        assert reloaded.messages[:-1] == session.messages
+        assert reloaded is session
+        assert reloaded.messages[-1]["_hidden_history"] is True
         assert reloaded.last_archived == 22
         assert reloaded.metadata["_last_summary"]["text"] == result
         assert [m["content"] for m in reloaded.get_history(max_messages=20)] == [SUMMARY_CONTINUATION_TEXT]

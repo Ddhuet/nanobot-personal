@@ -283,6 +283,7 @@ class Session:
     metadata: dict[str, Any] = field(default_factory=dict)
     # Keep the legacy storage name while persisted sessions and SDK callers migrate.
     last_consolidated: int = 0
+    reset_generation: int = field(default=0, repr=False, compare=False)
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     policy: SessionPolicy = field(default_factory=SessionPolicy, repr=False, compare=False)
 
@@ -348,6 +349,7 @@ class Session:
         max_tokens: int = 0,
         extend_to_user: bool = False,
         include_runtime_context: bool = True,
+        include_timestamps: bool = False,
     ) -> list[dict[str, Any]]:
         """Return recent replayable messages for LLM input.
 
@@ -439,6 +441,8 @@ class Session:
             for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
                 if key in message:
                     entry[key] = message[key]
+            if include_timestamps and "timestamp" in message and not message.get("_hidden_history"):
+                entry["timestamp"] = message["timestamp"]
             out.append(entry)
 
         if max_tokens > 0 and out:
@@ -476,6 +480,7 @@ class Session:
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
+        self.reset_generation += 1
         self.messages = []
         self.last_archived = 0
         self.provider_state = None

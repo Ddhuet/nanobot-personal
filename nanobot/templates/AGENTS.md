@@ -15,7 +15,7 @@ Use this file for project-specific preferences, recurring workflow conventions, 
 
 ## Heartbeat Tasks
 
-`HEARTBEAT.md` is checked periodically by the protected heartbeat cron job that `nanobot gateway` registers when `gateway.heartbeat.enabled` is true. Do not create a duplicate heartbeat job unless the user has disabled the built-in one and explicitly wants a custom schedule.
+`HEARTBEAT.md` is checked by an ordinary heartbeat cron job created once when gateway heartbeat is enabled. The job is important: do not delete or disable it casually. You can edit its instructions, schedule, history source, and default message destination with the cron tool. Restarting does not restore edits or a deleted job. Avoid creating a duplicate heartbeat job.
 
 - Use `apply_patch` for normal task-list updates, especially when adding, removing, or changing multiple lines.
 - Use `edit_file` only for small exact replacements copied from the current `HEARTBEAT.md`.

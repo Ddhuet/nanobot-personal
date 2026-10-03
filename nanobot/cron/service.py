@@ -71,6 +71,20 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
 
 def _validate_schedule_for_add(schedule: CronSchedule) -> None:
     """Validate schedule fields that would otherwise create non-runnable jobs."""
+    if schedule.kind not in {"at", "every", "cron"}:
+        raise ValueError("schedule kind must be at, every, or cron")
+    if schedule.kind == "every" and (
+        isinstance(schedule.every_ms, bool)
+        or not isinstance(schedule.every_ms, int)
+        or schedule.every_ms <= 0
+    ):
+        raise ValueError("every_ms must be a positive integer")
+    if schedule.kind == "at" and (
+        isinstance(schedule.at_ms, bool)
+        or not isinstance(schedule.at_ms, int)
+        or schedule.at_ms <= _now_ms()
+    ):
+        raise ValueError("one-time execution must be in the future")
     if schedule.tz and schedule.kind != "cron":
         raise ValueError("tz can only be used with cron schedules")
 
@@ -402,6 +416,9 @@ class CronService:
                         "originChannel": j.payload.origin_channel,
                         "originChatId": j.payload.origin_chat_id,
                         "originMetadata": j.payload.origin_metadata,
+                        "contextMode": j.payload.context_mode,
+                        "contextSessionKey": j.payload.context_session_key,
+                        "outputSessionKey": j.payload.output_session_key,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -507,7 +524,10 @@ class CronService:
             if self._enforce_agent_binding(job):
                 continue
             if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                if job.schedule.kind == "at" and job.state.last_status in {"error", "skipped"}:
+                    job.state.next_run_at_ms = max(now, job.state.next_run_at_ms or now + 60_000)
+                else:
+                    job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -643,7 +663,9 @@ class CronService:
 
         # Handle one-shot jobs
         if job.schedule.kind == "at":
-            if job.delete_after_run:
+            if job.state.last_status in {"error", "skipped"}:
+                job.state.next_run_at_ms = end_ms + 60_000
+            elif job.delete_after_run:
                 store = self._require_store()
                 store.jobs = [item for item in store.jobs if item.id != job.id]
             else:
@@ -700,6 +722,9 @@ class CronService:
         origin_channel: str | None = None,
         origin_chat_id: str | None = None,
         origin_metadata: dict[str, Any] | None = None,
+        context_mode: Literal["conversation", "last_active", "task", "none"] = "conversation",
+        context_session_key: str | None = None,
+        output_session_key: str | None = None,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -721,6 +746,9 @@ class CronService:
                 origin_channel=origin_channel,
                 origin_chat_id=origin_chat_id,
                 origin_metadata=origin_metadata or {},
+                context_mode=context_mode,
+                context_session_key=context_session_key,
+                output_session_key=output_session_key,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
@@ -739,6 +767,36 @@ class CronService:
 
         logger.info("Cron: added job '{}' ({})", name, job.id)
         return job
+
+    def seed_default_job(
+        self, name: str, *, enabled: bool, schedule: CronSchedule, message: str,
+        context_mode: Literal["conversation", "last_active", "task", "none"],
+        output_session_key: str,
+    ) -> None:
+        """Create an ordinary default once; preserve edits, disabling, and deletion.
+
+        Convert an older protected default at this boundary only. Execution and
+        every subsequent edit use the same policy as other agent cron jobs.
+        """
+        marker = self.store_path.parent / f".{name}-seeded"
+        store = self._require_store()
+        existing = next((job for job in store.jobs if job.id == name or job.name == name), None)
+        if existing is not None and existing.payload.kind == "system_event":
+            existing.payload = CronPayload(
+                message=message, context_mode=context_mode,
+                output_session_key=output_session_key,
+            )
+            existing.enabled = enabled
+            self._save_store()
+        elif not marker.exists() and existing is None and enabled:
+            job = self.add_job(
+                name=name, schedule=schedule, message=message,
+                context_mode=context_mode, output_session_key=output_session_key,
+            )
+            if not any(item.id == job.id for item in self.list_jobs(include_disabled=True)):
+                raise RuntimeError("default cron seed was not persisted")
+        if existing is not None or enabled:
+            self._atomic_write(marker, "seeded\n")
 
     def register_system_job(self, job: CronJob) -> CronJob:
         """Register an internal system job (idempotent on restart)."""
@@ -822,6 +880,10 @@ class CronService:
         channel: str | None | EllipsisType = ...,
         to: str | None | EllipsisType = ...,
         delete_after_run: bool | None = None,
+        context_mode: Literal["conversation", "last_active", "task", "none"] | None = None,
+        context_session_key: str | None | EllipsisType = ...,
+        output_session_key: str | None | EllipsisType = ...,
+        enabled: bool | None = None,
     ) -> CronJob | Literal["not_found", "protected"]:
         """Update mutable fields of an existing job. System jobs cannot be updated.
 
@@ -837,8 +899,9 @@ class CronService:
             return "protected"
 
         schedule_changed = schedule is not None and schedule != job.schedule
-        if schedule is not None:
+        if schedule is not None and schedule_changed:
             _validate_schedule_for_add(schedule)
+        if schedule is not None:
             job.schedule = schedule
         if name is not None:
             job.name = name
@@ -852,13 +915,21 @@ class CronService:
             job.payload.to = to
         if delete_after_run is not None:
             job.delete_after_run = delete_after_run
+        if context_mode is not None:
+            job.payload.context_mode = context_mode
+        if context_session_key is not ...:
+            job.payload.context_session_key = context_session_key
+        if output_session_key is not ...:
+            job.payload.output_session_key = output_session_key
+        if enabled is not None:
+            job.enabled = enabled
         _normalize_agent_turn_job(job)
         self._enforce_agent_binding(job)
 
         job.updated_at_ms = _now_ms()
         if not job.enabled:
             job.state.next_run_at_ms = None
-        elif schedule_changed:
+        elif schedule_changed or enabled is True:
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
 
         if self._should_persist_store():

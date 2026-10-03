@@ -61,6 +61,10 @@ class CronPayload:
     origin_channel: str | None = None
     origin_chat_id: str | None = None
     origin_metadata: dict[str, Any] = field(default_factory=dict)
+    # Resolve conversation history and message delivery independently at run time.
+    context_mode: Literal["conversation", "last_active", "task", "none"] = "conversation"
+    context_session_key: str | None = None
+    output_session_key: str | None = None  # None = origin; "last_active" = latest user chat
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronPayload:
@@ -79,6 +83,9 @@ class CronPayload:
             origin_metadata=dict(
                 get_camel_snake(data, "originMetadata", "origin_metadata", {}) or {}
             ),
+            context_mode=get_camel_snake(data, "contextMode", "context_mode", "conversation"),
+            context_session_key=get_camel_snake(data, "contextSessionKey", "context_session_key"),
+            output_session_key=get_camel_snake(data, "outputSessionKey", "output_session_key"),
         )
 
 

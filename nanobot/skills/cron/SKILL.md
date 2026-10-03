@@ -1,59 +1,33 @@
 ---
 name: cron
-description: Schedule reminders and recurring tasks.
+description: Schedule silent agent tasks with independent conversation context and message destinations.
 ---
 
 # Cron
 
-Use the `cron` tool to schedule reminders or recurring tasks that should report back to the originating chat/session when they run.
+Use the cron tool to add, update, list, disable, enable, or remove scheduled agent tasks. Every run is silent unless it explicitly calls the message tool. Include that instruction in reminders: "Use message to remind the user ...". Final answers, progress, and reasoning stay internal.
 
-Do not use `cron` for periodic background checks that should stay quiet when there is nothing useful to report. For those, update `HEARTBEAT.md`; the protected heartbeat job runs those checks and only delivers results that pass the notification gate.
+Supply exactly one schedule on add (or when replacing a schedule): a positive every_seconds, a valid cron_expr with optional IANA tz, or a future ISO at time. Naive times and cron expressions without tz use the tool's configured timezone. Successful one-time tasks auto-delete; failed runs retry after one minute.
 
-## Three Modes
+History and delivery are independent:
 
-1. **Reminder** - message is sent directly to user
-2. **Task** - message is a task description, agent executes and sends result
-3. **One-time** - runs once at a specific time, then auto-deletes
+- context_mode="conversation": read the newest history of context_session_key (originating chat by default).
+- context_mode="last_active": read the most recently active user chat at execution time.
+- context_mode="task": keep this task's own conversation across runs.
+- context_mode="none": no prior conversation history, just the task instruction and normal bootstrap rules.
+- output_session_key: exact known chat session key, @handle, or "last_active"; defaults to the originating chat. It sets the message tool's default target, never automatic delivery.
 
-## Examples
+Use list_sessions, search_sessions, and read_session to identify known conversations. Ask for a reference/ID for a never-seen destination; do not invent one. History is read at execution time, not captured when scheduling.
 
-Fixed reminder:
-```
-cron(action="add", message="Time to take a break!", every_seconds=1200)
-```
+Examples:
 
-Dynamic task (agent executes each time):
-```
-cron(action="add", message="Check HKUDS/nanobot GitHub stars and report", every_seconds=600)
-```
-
-One-time scheduled task (compute ISO datetime from current time):
-```
-cron(action="add", message="Remind me about the meeting", at="<ISO datetime>")
-```
-
-Timezone-aware cron:
-```
-cron(action="add", message="Morning standup", cron_expr="0 9 * * 1-5", tz="America/Vancouver")
-```
-
-List/remove:
-```
+```text
+cron(action="add", message="Use message to remind the user to take a break", every_seconds=1200, context_mode="none")
+cron(action="add", message="Summarize the developer's recent work and send useful updates with message", cron_expr="0 9 * * *", context_mode="conversation", context_session_key="discord:developer-dm", output_session_key="discord:team-channel")
+cron(action="update", job_id="abc123", context_mode="last_active", output_session_key="last_active", every_seconds=1800)
+cron(action="update", job_id="abc123", enabled=false)
 cron(action="list")
 cron(action="remove", job_id="abc123")
 ```
 
-## Time Expressions
-
-| User says | Parameters |
-|-----------|------------|
-| every 20 minutes | every_seconds: 1200 |
-| every hour | every_seconds: 3600 |
-| every day at 8am | cron_expr: "0 8 * * *" |
-| weekdays at 5pm | cron_expr: "0 17 * * 1-5" |
-| 9am Vancouver time daily | cron_expr: "0 9 * * *", tz: "America/Vancouver" |
-| at a specific time | at: ISO datetime string (compute from current time) |
-
-## Timezone
-
-Use `tz` with `cron_expr` to schedule in a specific IANA timezone. Without `tz`, the server's local timezone is used.
+The default heartbeat is an ordinary editable job that reads HEARTBEAT.md. It carries an importance warning, but can be modified, disabled, or deleted. Periodic checks may also be ordinary cron tasks with instructions to message only actionable changes. No evaluator gates delivery.

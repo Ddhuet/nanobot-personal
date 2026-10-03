@@ -52,7 +52,7 @@ async def test_process_direct_websocket_clears_run_status(tmp_path) -> None:
     try:
         response = await loop.process_direct(
             "deliver reminder",
-            session_key="cron:reminder-1",
+            session_key="websocket:chat-1",
             channel="websocket",
             chat_id="chat-1",
         )

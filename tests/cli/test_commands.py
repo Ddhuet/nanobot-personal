@@ -27,7 +27,6 @@ from nanobot.cli import webui_support as cli_webui_support
 from nanobot.cli.commands import app
 from nanobot.config.schema import Config
 from nanobot.cron.service import CronJobSkippedError
-from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronPayload, CronRunResult
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
 from nanobot.providers.factory import ProviderSnapshot, make_provider, provider_signature
@@ -1838,84 +1837,6 @@ def test_agent_workspace_override_wins_over_config_workspace(mock_agent_runtime,
     assert passed_config.workspace_path == workspace_path
 
 
-@pytest.mark.parametrize(
-    "content, expected",
-    [
-        ("", False),
-        ("# Title\n\n## Active Tasks\n", False),
-        ("<!--\nmulti-line\ncomment\n-->\n", False),  # block comment, not tasks
-        ("<!-- single line -->\n", False),
-        ("## Active Tasks\n\n- water the plants\n", True),
-        ("## Active Tasks\n\n### Garden\n\n- water the plants\n", True),
-        ("## Notes\n\nsome random note\n", False),
-        ("stray text before any heading\n## Active Tasks\n\n- task\n", True),
-        ("stray text before any heading\n", False),
-    ],
-)
-def test_heartbeat_has_active_tasks(content, expected):
-    from nanobot.cli.gateway_runtime import _heartbeat_has_active_tasks
-
-    assert _heartbeat_has_active_tasks(content) is expected
-
-
-def test_heartbeat_skips_bundled_template():
-    from nanobot.cli.gateway_runtime import _heartbeat_has_active_tasks
-    from nanobot.utils.helpers import load_bundled_template
-
-    assert _heartbeat_has_active_tasks(load_bundled_template("HEARTBEAT.md")) is False
-
-
-def test_heartbeat_target_skips_archived_webui_sessions():
-    from nanobot.cli.gateway_runtime import _pick_heartbeat_target_from_sessions
-
-    target = _pick_heartbeat_target_from_sessions(
-        enabled_channels=["websocket"],
-        archived_keys=["websocket:archived"],
-        sessions=[
-            {"key": "websocket:archived"},
-            {"key": "websocket:active"},
-        ],
-    )
-
-    assert target == ("websocket", "active")
-
-
-def test_heartbeat_target_uses_last_channel_for_unified_session():
-    from nanobot.cli.gateway_runtime import _pick_heartbeat_target_from_sessions
-    from nanobot.session.keys import LAST_CHANNEL_METADATA_KEY, UNIFIED_SESSION_KEY
-
-    target = _pick_heartbeat_target_from_sessions(
-        enabled_channels=["telegram", "discord"],
-        archived_keys=[],
-        sessions=[{"key": UNIFIED_SESSION_KEY}],
-        unified_session_metadata={LAST_CHANNEL_METADATA_KEY: "discord:chat-42"},
-    )
-
-    assert target == ("discord", "chat-42")
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        {"last_channel": "telegram:chat-42"},
-        {"last_channel": "cli:direct"},
-        {"last_channel": "invalid"},
-    ],
-)
-def test_heartbeat_target_rejects_unroutable_unified_metadata(metadata):
-    from nanobot.cli.gateway_runtime import _pick_heartbeat_target_from_sessions
-    from nanobot.session.keys import UNIFIED_SESSION_KEY
-
-    target = _pick_heartbeat_target_from_sessions(
-        enabled_channels=["discord"],
-        archived_keys=[],
-        sessions=[{"key": UNIFIED_SESSION_KEY}],
-        unified_session_metadata=metadata,
-    )
-
-    assert target == ("cli", "direct")
-
-
 def _write_instance_config(tmp_path: Path) -> Path:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
@@ -2094,94 +2015,6 @@ def _patch_cli_command_runtime(
         monkeypatch.setattr("nanobot.cron.service.CronService", cron_service)
     if get_cron_dir is not None:
         monkeypatch.setattr("nanobot.config.paths.get_cron_dir", get_cron_dir)
-
-
-def test_heartbeat_empty_response_is_not_evaluated(
-    monkeypatch, tmp_path: Path,
-) -> None:
-    config_file = _write_instance_config(tmp_path)
-    config = Config()
-    config.agents.defaults.workspace = str(tmp_path / "workspace")
-    config.agents.defaults.dream.enabled = True
-    config.workspace_path.mkdir(parents=True)
-    (config.workspace_path / "HEARTBEAT.md").write_text(
-        "## Active Tasks\n\n- Check repository health\n",
-        encoding="utf-8",
-    )
-
-    provider = _fake_provider()
-    bus = MagicMock()
-    bus.publish_outbound = AsyncMock()
-    seen: dict[str, object] = {}
-
-    class _FakeSessionManager:
-        def __init__(self, _workspace: Path) -> None:
-            pass
-
-        def list_sessions(self) -> list[dict[str, str]]:
-            return [{"key": "telegram:u1"}]
-
-    class _FakeCron:
-        def __init__(self, _store_path: Path) -> None:
-            self.on_job = None
-            seen["cron"] = self
-
-        def status(self) -> dict[str, int]:
-            return {"jobs": 0}
-
-        def register_system_job(self, _job: CronJob) -> None:
-            raise _StopGatewayError("stop")
-
-    class _FakeAgentLoop(_GatewayAgentContractStub):
-        @classmethod
-        def from_config(cls, config, bus=None, **extra):
-            return cls(**extra)
-
-        def __init__(self, *args, **kwargs) -> None:
-            self.model = "test-model"
-            self.provider = kwargs.get("provider", object())
-            self.sessions = kwargs["session_manager"]
-            self.tools = {}
-
-        async def process_direct(self, *_args, **_kwargs):
-            return SimpleNamespace(content="")
-
-        async def aclose(self) -> None:
-            return None
-
-        async def run(self) -> None:
-            return None
-
-        def stop(self) -> None:
-            return None
-
-    class _FakeChannelManager:
-        def __init__(self, *_args, **_kwargs) -> None:
-            self.enabled_channels = ["telegram"]
-
-    async def _unexpected_evaluator(*_args, **_kwargs) -> bool:
-        raise AssertionError("empty heartbeat response must not be evaluated")
-
-    _patch_cli_command_runtime(
-        monkeypatch,
-        config,
-        make_provider=lambda _config: provider,
-        message_bus=lambda: bus,
-        session_manager=_FakeSessionManager,
-        cron_service=_FakeCron,
-    )
-    monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
-    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
-    monkeypatch.setattr("nanobot.cli.gateway_runtime.read_webui_sidebar_state", lambda: {})
-    monkeypatch.setattr("nanobot.cli.gateway_runtime.evaluate_response", _unexpected_evaluator)
-
-    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
-
-    assert isinstance(result.exception, _StopGatewayError)
-    cron = seen["cron"]
-    response = asyncio.run(cron.on_job(CronJob(id="heartbeat", name="heartbeat")))
-
-    assert response is None
 
 
 def test_webui_yes_creates_config_and_enables_local_websocket(
@@ -3138,10 +2971,6 @@ def test_gateway_unbound_agent_cron_is_skipped(
     monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
     monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
-    monkeypatch.setattr(
-        "nanobot.cli.gateway_runtime.evaluate_response",
-        _capture_evaluate_response,
-    )
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
@@ -3166,221 +2995,51 @@ def test_gateway_unbound_agent_cron_is_skipped(
         ),
     )
 
-    with pytest.raises(CronJobSkippedError, match="unbound agent cron job"):
+    with pytest.raises(CronJobSkippedError, match="no active conversation"):
         asyncio.run(cron.on_job(job))
 
     bus.publish_outbound.assert_not_awaited()
 
 
-def test_gateway_bound_cron_runs_as_session_turn(
-    monkeypatch, tmp_path: Path
-) -> None:
-    config_file = tmp_path / "instance" / "config.json"
-    config_file.parent.mkdir(parents=True)
-    config_file.write_text("{}")
-
+def test_gateway_cron_delegates_to_silent_executor(monkeypatch, tmp_path):
+    config_file = _write_instance_config(tmp_path)
     config = Config()
-    config.agents.defaults.workspace = str(tmp_path / "config-workspace")
-    provider = _fake_provider()
-    bus = MagicMock()
-    bus.publish_outbound = AsyncMock()
-    seen: dict[str, object] = {"run_records": []}
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    seen = {}
 
-    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
-    monkeypatch.setattr("nanobot.cli.gateway_runtime.sync_workspace_templates", lambda _path: None)
-    monkeypatch.setattr("nanobot.providers.factory.make_provider", lambda _config: provider)
-    monkeypatch.setattr("nanobot.cli.webui_support._provider_setup_error", lambda _config: None)
-    _patch_gateway_ports_free(monkeypatch)
-    monkeypatch.setattr(
-        "nanobot.providers.factory.build_provider_snapshot",
-        lambda _config: _test_provider_snapshot(provider, _config),
-    )
-    monkeypatch.setattr(
-        "nanobot.providers.factory.load_provider_snapshot",
-        lambda _config_path=None: _test_provider_snapshot(provider, config),
-    )
-    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
-
-    class _FakeSessionManager:
-        def __init__(self, _workspace: Path) -> None:
-            pass
-
-    monkeypatch.setattr("nanobot.session.manager.SessionManager", _FakeSessionManager)
-
-    class _FakeCron:
-        def __init__(self, _store_path: Path) -> None:
+    class FakeCron:
+        def __init__(self, _path):
             self.on_job = None
             seen["cron"] = self
 
-        def write_run_record(self, run_id: str, record: dict[str, object]) -> None:
-            seen["run_records"].append((run_id, record))
-
-    class _FakeAgentLoop(_GatewayAgentContractStub):
+    class FakeAgent(_GatewayAgentContractStub):
         @classmethod
         def from_config(cls, config, bus=None, **extra):
-            return cls(**extra)
+            seen["agent"] = cls()
+            return seen["agent"]
 
-        def __init__(self, *args, **kwargs) -> None:
-            self.model = "test-model"
-            self.provider = kwargs.get("provider", object())
-            self.tools = {}
-            seen["agent"] = self
-
-        async def submit_cron_turn(self, msg: InboundMessage):
-            seen["cron_msg"] = msg
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="Checked the repo.",
-            )
-
-        async def aclose(self) -> None:
-            return None
-
-        async def run(self) -> None:
-            return None
-
-        def stop(self) -> None:
-            return None
-
-    class _StopAfterCronSetup:
-        def __init__(self, *_args, **_kwargs) -> None:
+    class StopChannels:
+        def __init__(self, *_args, **_kwargs):
             raise _StopGatewayError("stop")
 
-    async def _unexpected_evaluator(*_args, **_kwargs) -> bool:
-        raise AssertionError("bound cron must not use legacy response evaluator")
+    async def execute(job, **kwargs):
+        seen["job"] = job
+        seen["execution"] = kwargs
+        return CronRunResult(run_id="test-run", response="internal")
 
-    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
-    monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
-    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
-    monkeypatch.setattr("nanobot.cli.gateway_runtime.evaluate_response", _unexpected_evaluator)
-
+    _patch_cli_command_runtime(monkeypatch, config, cron_service=FakeCron)
+    monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", FakeAgent)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", StopChannels)
+    monkeypatch.setattr("nanobot.cron.execution.run_cron_job", execute)
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
     assert isinstance(result.exception, _StopGatewayError)
-
-    cron = seen["cron"]
-    job = CronJob(
-        id="repo-check",
-        name="Repo check",
-        payload=CronPayload(
-            message="Check repository health.",
-            session_key="websocket:chat-1",
-            origin_channel="websocket",
-            origin_chat_id="chat-1",
-        ),
-    )
-
-    response = asyncio.run(cron.on_job(job))
-
-    assert isinstance(response, CronRunResult)
-    assert response.response == "Checked the repo."
-    assert response.run_id == seen["run_records"][-1][0]
-    msg = seen["cron_msg"]
-    assert isinstance(msg, InboundMessage)
-    assert msg.channel == "websocket"
-    assert msg.chat_id == "chat-1"
-    assert msg.sender_id == "cron"
-    assert msg.session_key_override == "websocket:chat-1"
-    assert "Cron job: Check repository health." in msg.content
-    assert msg.metadata["webui"] is True
-    assert msg.metadata[WEBUI_MESSAGE_SOURCE_METADATA_KEY] == {
-        "kind": "cron",
-        "label": "Repo check",
-    }
-    trigger = msg.metadata[CRON_TRIGGER_META]
-    assert trigger["job_id"] == "repo-check"
-    assert trigger["job_name"] == "Repo check"
-    assert trigger["persist_content"] == (
-        "Scheduled cron job triggered: Repo check\n\nCheck repository health."
-    )
-    assert msg.metadata[CRON_DEFER_UNTIL_IDLE_META] is True
-    statuses = [record["status"] for _run_id, record in seen["run_records"]]
-    assert statuses == ["queued", "ok"]
-    assert seen["run_records"][0][0] == seen["run_records"][1][0]
-
-    discord_job = CronJob(
-        id="thread-check",
-        name="Thread check",
-        payload=CronPayload(
-            message="Check the Discord thread.",
-            session_key="discord:456:thread:777",
-            origin_channel="discord",
-            origin_chat_id="777",
-            origin_metadata={
-                "context_chat_id": "456",
-                "parent_channel_id": "456",
-                "thread_id": "777",
-            },
-        ),
-    )
-
-    response = asyncio.run(cron.on_job(discord_job))
-
-    assert isinstance(response, CronRunResult)
-    assert response.response == "Checked the repo."
-    assert response.run_id == seen["run_records"][-1][0]
-    msg = seen["cron_msg"]
-    assert isinstance(msg, InboundMessage)
-    assert msg.channel == "discord"
-    assert msg.chat_id == "777"
-    assert msg.session_key_override == "discord:456:thread:777"
-    assert msg.metadata["context_chat_id"] == "456"
-    assert msg.metadata["parent_channel_id"] == "456"
-    assert msg.metadata["thread_id"] == "777"
-
-    telegram_job = CronJob(
-        id="telegram-topic",
-        name="Telegram topic",
-        payload=CronPayload(
-            message="Check the Telegram topic.",
-            session_key="telegram:-100123:topic:42",
-            origin_channel="telegram",
-            origin_chat_id="-100123",
-            origin_metadata={"message_thread_id": 42},
-        ),
-    )
-
-    response = asyncio.run(cron.on_job(telegram_job))
-
-    assert isinstance(response, CronRunResult)
-    assert response.response == "Checked the repo."
-    assert response.run_id == seen["run_records"][-1][0]
-    msg = seen["cron_msg"]
-    assert isinstance(msg, InboundMessage)
-    assert msg.channel == "telegram"
-    assert msg.chat_id == "-100123"
-    assert msg.session_key_override == "telegram:-100123:topic:42"
-    assert msg.metadata["message_thread_id"] == 42
-
-    feishu_job = CronJob(
-        id="feishu-topic",
-        name="Feishu topic",
-        payload=CronPayload(
-            message="Check the Feishu topic.",
-            session_key="feishu:oc_abc:om_root123",
-            origin_channel="feishu",
-            origin_chat_id="oc_abc",
-            origin_metadata={
-                "chat_type": "group",
-                "message_id": "om_root123",
-                "thread_id": "om_root123",
-            },
-        ),
-    )
-
-    response = asyncio.run(cron.on_job(feishu_job))
-
-    assert isinstance(response, CronRunResult)
-    assert response.response == "Checked the repo."
-    assert response.run_id == seen["run_records"][-1][0]
-    msg = seen["cron_msg"]
-    assert isinstance(msg, InboundMessage)
-    assert msg.channel == "feishu"
-    assert msg.chat_id == "oc_abc"
-    assert msg.session_key_override == "feishu:oc_abc:om_root123"
-    assert msg.metadata["message_id"] == "om_root123"
-    assert msg.metadata["thread_id"] == "om_root123"
+    job = CronJob(id="report", name="report", payload=CronPayload(message="check"))
+    response = asyncio.run(seen["cron"].on_job(job))
+    assert response.response == "internal"
+    assert seen["job"] is job
+    assert seen["execution"]["agent"] is seen["agent"]
+    assert seen["execution"]["cron"] is seen["cron"]
+    assert callable(seen["execution"]["last_active"])
 
 
 @pytest.mark.parametrize("setup_error", [None, "No API key configured"])
@@ -3440,6 +3099,10 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
 
         def register_system_job(self, _job) -> None:
             return None
+
+        def seed_default_job(self, name, **kwargs):
+            assert kwargs["context_mode"] == kwargs["output_session_key"] == "last_active"
+            seen.setdefault("cron_reconciliation", []).append("seed:heartbeat")
 
         def remove_system_job(self, job_id: str) -> bool:
             seen.setdefault("cron_reconciliation", []).append(f"remove:{job_id}")
@@ -3521,7 +3184,7 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
     turn_delivery_factory = agent_kwargs["turn_delivery_factory"]
     assert isinstance(turn_delivery_factory, TurnDeliveryFactory)
     assert turn_delivery_factory.bus is bus
-    assert seen["cron_reconciliation"] == ["remove:dream", "remove:heartbeat", "status"]
+    assert seen["cron_reconciliation"] == ["remove:dream", "seed:heartbeat", "status"]
     assert isinstance(turn_delivery_factory.route_policy, WebuiTurnRoutePolicy)
     assert turn_delivery_factory.route_policy.sessions is agent.sessions
 

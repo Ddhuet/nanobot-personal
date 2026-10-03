@@ -28,7 +28,12 @@ from nanobot.security.workspace_access import WorkspaceScopeResolver
 from nanobot.session.keys import last_channel_from_metadata
 from nanobot.session.manager import Session
 from nanobot.session.summary import SessionSummary
-from nanobot.utils.helpers import detect_image_mime, load_bundled_template
+from nanobot.utils.helpers import (
+    detect_image_mime,
+    format_message_timestamp,
+    load_bundled_template,
+    strip_leading_timestamp,
+)
 from nanobot.utils.prompt_templates import render_template
 
 
@@ -293,7 +298,7 @@ class ContextBuilder:
                     include_memory=include_memory,
                 ),
             },
-            *transcript.history,
+            *self._annotate_timestamps(transcript.history),
         ]
         if transcript.current_message is None:
             return messages
@@ -306,6 +311,21 @@ class ContextBuilder:
         )
         messages.append(current)
         return messages
+
+    def _annotate_timestamps(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        annotated: list[dict[str, Any]] = []
+        for original in history:
+            message = {key: value for key, value in original.items() if key != "timestamp"}
+            if original.get("role") in {"user", "assistant"} and original.get("timestamp"):
+                label = format_message_timestamp(original["timestamp"], self.timezone)
+                content = original.get("content", "")
+                if isinstance(content, str):
+                    clean = strip_leading_timestamp(content) or ""
+                    message["content"] = f"{label} {clean}" if clean else label
+                elif isinstance(content, list):
+                    message["content"] = [{"type": "text", "text": label}, *content]
+            annotated.append(message)
+        return annotated
 
     def build_current_message(
         self,

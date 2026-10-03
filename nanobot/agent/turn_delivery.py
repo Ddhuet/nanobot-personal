@@ -20,6 +20,7 @@ from nanobot.bus.outbound_events import (
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import RuntimeEventPublisher
 from nanobot.channels.notification_routes import notification_metadata
+from nanobot.cron.session_turns import is_cron_turn
 from nanobot.events import AgentEvent, EventSink
 from nanobot.providers.base import LLMUsage
 from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
@@ -90,7 +91,11 @@ class TurnDeliveryFactory:
         enable_stream: bool = False,
     ) -> TurnDelivery:
         route = self._default_route(msg, session_key)
-        if self.route_policy is not None:
+        silent = bool(msg.metadata.get("_cron_silent") or is_cron_turn(msg.metadata)
+                      or session_key.startswith("cron:"))
+        if silent:
+            route = dataclasses.replace(route, publish_lifecycle=False)
+        elif self.route_policy is not None:
             route = self.route_policy(msg, session_key, route)
             if not isinstance(cast(object, route), TurnRoute):
                 raise TypeError("turn route policy must return TurnRoute")
@@ -198,6 +203,8 @@ class TurnDelivery:
     def __post_init__(self) -> None:
         self._routed_events = _bind_events(self.bus, self.route)
         self.events = EventSink(self._publish_event, self._routed_events.accepts)
+        if self.silent:
+            self.events = EventSink()
         self.delivery_message = dataclasses.replace(
             self.input_message,
             channel=self.route.channel,
@@ -207,12 +214,20 @@ class TurnDelivery:
         self.lifecycle_message = (
             self.delivery_message if self.route.publish_lifecycle else self.input_message
         )
-        if self.enable_stream and self.delivery_message.metadata.get("_wants_stream"):
+        if not self.silent and self.enable_stream and self.delivery_message.metadata.get("_wants_stream"):
             self._stream_base_id = f"{self.session_key}:{time.time_ns()}"
 
     @property
     def streaming(self) -> bool:
         return self._stream_base_id is not None
+
+    @property
+    def silent(self) -> bool:
+        return bool(
+            self.input_message.metadata.get("_cron_silent")
+            or is_cron_turn(self.input_message.metadata)
+            or self.session_key.startswith("cron:")
+        )
 
     def remember_session_route(self, session_metadata: dict[str, Any]) -> None:
         """Keep only routing fields needed to deliver a later idle notification."""
@@ -297,6 +312,8 @@ class TurnDelivery:
         *,
         publish_completion: bool,
     ) -> None:
+        if self.silent:
+            return
         stop_reason = self._stop_reason
         if stop_reason is None and response is not None:
             stop_reason = cast(str | None, response.metadata.get("_stop_reason"))
@@ -334,6 +351,8 @@ class TurnDelivery:
             )
 
     async def fail(self, *, publish_completion: bool) -> None:
+        if self.silent:
+            return
         await self.bus.publish_outbound(
             OutboundMessage(
                 channel=self.lifecycle_message.channel,
@@ -353,6 +372,9 @@ class TurnDelivery:
             )
 
     async def idle(self) -> None:
+        if self.silent:
+            self.runtime_event_publisher.clear_turn(self.session_key)
+            return
         await self.runtime_event_publisher.run_status_changed(
             self.lifecycle_message,
             self.session_key,

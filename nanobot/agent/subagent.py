@@ -19,6 +19,7 @@ from nanobot.agent.tools.context import (
     RequestContext,
     ToolContext,
     bind_request_context,
+    current_request_context,
     reset_request_context,
 )
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -45,6 +46,7 @@ class _SubagentOrigin(TypedDict):
     chat_id: str
     session_key: str | None
     llm_usage_source: NotRequired[LLMUsageSource]
+    metadata: NotRequired[dict[str, Any]]
 
 
 @dataclass(slots=True)
@@ -250,6 +252,9 @@ class SubagentManager:
             "session_key": session_key,
             "llm_usage_source": current_llm_usage_source(),
         }
+        request = current_request_context()
+        if request is not None and request.metadata.get("_cron_silent"):
+            origin["metadata"] = dict(request.metadata)
 
         status = SubagentStatus(
             task_id=task_id,
@@ -513,6 +518,7 @@ class SubagentManager:
         # being dispatched as a competing independent task.
         override = origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
         metadata: dict[str, Any] = {
+            **origin.get("metadata", {}),
             "injected_event": "subagent_result",
             "subagent_task_id": task_id,
         }

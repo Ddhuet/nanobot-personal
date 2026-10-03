@@ -165,6 +165,46 @@ _THINKING_TAG_PREFIX = "|".join(
 _PARTIAL_THINKING_TAG = rf"</?(?:{_THINKING_TAG_PREFIX})>?"
 
 
+_LEADING_TIMESTAMP_RE = re.compile(
+    r"^[\s\u200b\ufeff]*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*"
+)
+
+
+def strip_leading_timestamp(text: str | None) -> str | None:
+    """Remove an accidental leading message-history timestamp from model output.
+
+    Models sometimes put a newline, a zero-width space, or a byte-order mark
+    before the copied label.  Chat clients do not make those characters
+    visible, so tolerate them while still requiring the exact history label.
+    """
+    if not text:
+        return text
+    return _LEADING_TIMESTAMP_RE.sub("", text)
+
+
+def format_message_timestamp(ts: str, timezone: str | None = None) -> str:
+    """Format an ISO timestamp string as a compact inline label for message history.
+
+    Returns something like ``[2025-05-02 14:30]`` using the configured timezone.
+    Falls back to the raw string when parsing fails.
+    """
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return ts
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(timezone) if timezone else None
+    except (KeyError, Exception):
+        tz = None
+    if tz:
+        dt = dt.astimezone(tz)
+    elif dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.strftime("[%Y-%m-%d %H:%M]")
+
+
+
 def strip_think(text: str) -> str:
     """Remove thinking blocks, unclosed trailing tags, and tokenizer-level
     template leaks occasionally emitted by some models (notably Gemma 4's

@@ -6,11 +6,12 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext, current_request_context
 from nanobot.agent.tools.schema import (
+    BooleanSchema,
     IntegerSchema,
     StringSchema,
     tool_parameters_schema,
@@ -18,9 +19,10 @@ from nanobot.agent.tools.schema import (
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 from nanobot.session.keys import UNIFIED_SESSION_KEY
+from nanobot.session.manager import SessionManager
 
 _CRON_PARAMETERS = tool_parameters_schema(
-    action=StringSchema("Action to perform", enum=["add", "list", "remove"]),
+    action=StringSchema("Action to perform", enum=["add", "update", "list", "remove"]),
     name=StringSchema(
         "Optional short human-readable label for the job "
         "(e.g., 'weather-monitor', 'daily-standup'). Defaults to first 30 chars of message."
@@ -30,7 +32,7 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report'). "
         "Not used for action='list' or action='remove'."
     ),
-    every_seconds=IntegerSchema(description="Interval in seconds (for recurring tasks)"),
+    every_seconds=IntegerSchema(description="Positive interval in seconds (for recurring tasks)", minimum=1),
     cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
     tz=StringSchema(
         "Optional IANA timezone for cron expressions (e.g. 'America/Vancouver'). "
@@ -40,7 +42,26 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
         "Naive values use the tool's default timezone."
     ),
-    job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
+    context_mode=StringSchema(
+        "Conversation history: conversation = latest history of context_session_key (origin by default); "
+        "last_active = latest active user chat resolved at execution; task = this job's own persistent "
+        "conversation, including earlier runs; none = no prior conversation, instructions only. "
+        "Defaults to conversation on add; omitted fields stay unchanged on update.",
+        enum=["conversation", "last_active", "task", "none"],
+    ),
+    context_session_key=StringSchema(
+        "Exact known conversation session key or @handle to read when context_mode=conversation. "
+        "Read its newest history when running, never the history at scheduling time. "
+        "Omit on add to use the originating conversation.",
+    ),
+    output_session_key=StringSchema(
+        "Independent default destination for the message tool: an exact known conversation "
+        "session key, @handle, or last_active. Omit on add to use the originating conversation. "
+        "All cron output requires message; final answers and progress are never auto-delivered. "
+        "Use search_sessions/read_session for known sessions; never invent channel IDs.",
+    ),
+    enabled=BooleanSchema(description="Enable or disable a job when action=update."),
+    job_id=StringSchema("REQUIRED when action='remove' or action='update'. Job ID (obtain via action='list')."),
     required=["action"],
     description=(
         "Action-specific parameters: add requires a non-empty message plus one schedule "
@@ -56,8 +77,9 @@ _CRON_PARAMETERS = tool_parameters_schema(
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
 
-    def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
+    def __init__(self, cron_service: CronService, default_timezone: str = "UTC", sessions: SessionManager | None = None):
         self._cron = cron_service
+        self._sessions = sessions
         self._default_timezone = default_timezone
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
@@ -70,7 +92,7 @@ class CronTool(Tool):
         cron_service = ctx.cron_service
         if cron_service is None:
             raise RuntimeError("CronTool requires an initialized cron service")
-        return cls(cron_service=cron_service, default_timezone=ctx.timezone)
+        return cls(cron_service=cron_service, default_timezone=ctx.timezone, sessions=ctx.sessions)
 
     @staticmethod
     def _request_route() -> tuple[str, str, str, dict[str, Any]]:
@@ -120,7 +142,9 @@ class CronTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Schedule reminders and recurring tasks. Actions: add, list, remove. "
+            "Schedule silent agent tasks. Actions: add, update, list, remove. "
+            "Each run receives separately selected conversation history and message destination. "
+            "Only the message tool delivers output; ordinary final text stays internal. "
             f"If tz is omitted, cron expressions and naive ISO times default to {self._default_timezone}."
         )
 
@@ -129,94 +153,125 @@ class CronTool(Tool):
         action = params.get("action")
         if action == "add" and not str(params.get("message") or "").strip():
             errors.append("message is required when action='add'")
-        if action == "remove" and not str(params.get("job_id") or "").strip():
-            errors.append("job_id is required when action='remove'")
+        if action in {"remove", "update"} and not str(params.get("job_id") or "").strip():
+            errors.append(f"job_id is required when action='{action}'")
         return errors
 
+    def _schedule(
+        self, every_seconds: int | None, cron_expr: str | None,
+        tz: str | None, at: str | None, *, required: bool,
+    ) -> CronSchedule | None:
+        supplied = sum(value is not None for value in (every_seconds, cron_expr, at))
+        if supplied != 1 and (required or supplied):
+            raise ValueError("supply exactly one of every_seconds, cron_expr, or at")
+        if tz is not None and cron_expr is None:
+            raise ValueError("tz can only be used with cron_expr")
+        if not supplied:
+            return None
+        if every_seconds is not None:
+            return CronSchedule(kind="every", every_ms=self._positive_interval(every_seconds) * 1000)
+        if cron_expr is not None:
+            return CronSchedule(kind="cron", expr=cron_expr, tz=tz or self._default_timezone)
+        from zoneinfo import ZoneInfo
+
+        dt = datetime.fromisoformat(at or "")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo(self._default_timezone))
+        return CronSchedule(kind="at", at_ms=int(dt.timestamp() * 1000))
+
+    @staticmethod
+    def _positive_interval(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("every_seconds must be a positive integer")
+        return value
+
     async def execute(
-        self,
-        action: str,
-        name: str | None = None,
-        message: str = "",
-        every_seconds: int | None = None,
-        cron_expr: str | None = None,
-        tz: str | None = None,
-        at: str | None = None,
-        job_id: str | None = None,
+        self, action: str, name: str | None = None, message: str | None = None,
+        every_seconds: int | None = None, cron_expr: str | None = None,
+        tz: str | None = None, at: str | None = None, job_id: str | None = None,
+        context_mode: Literal["conversation", "last_active", "task", "none"] | None = None,
+        context_session_key: str | None = None, output_session_key: str | None = None,
+        enabled: bool | None = None,
     ) -> str:
-        if action == "add":
-            if self._in_cron_context.get():
-                return ToolResult.error("Error: cannot schedule new jobs from within a cron job execution")
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at)
-        elif action == "list":
+        if action == "list":
             return self._list_jobs()
-        elif action == "remove":
+        if action == "remove":
             return self._remove_job(job_id)
-        return f"Unknown action: {action}"
+        if action not in {"add", "update"}:
+            return ToolResult.error(f"Unknown action: {action}")
+        if action == "add" and self._in_cron_context.get():
+            return ToolResult.error("Error: cannot schedule new jobs from within a cron job execution")
+        try:
+            if message is not None and not message.strip():
+                raise ValueError("message must not be empty")
+            if action == "add" and not message:
+                raise ValueError(
+                    "cron action='add' requires a non-empty 'message'. Retry including message=\"...\""
+                )
+            if context_mode is not None and context_mode not in {"conversation", "last_active", "task", "none"}:
+                raise ValueError("context_mode must be conversation, last_active, task, or none")
+            schedule = self._schedule(every_seconds, cron_expr, tz, at, required=action == "add")
+            if action == "update":
+                if not job_id:
+                    raise ValueError("job_id is required when action=update")
+                fields: dict[str, Any] = {}
+                if context_session_key is not None:
+                    fields["context_session_key"] = context_session_key
+                if output_session_key is not None:
+                    fields["output_session_key"] = output_session_key
+                self._validate_targets(context_session_key, output_session_key)
+                result = self._cron.update_job(
+                    job_id, name=name, message=message, schedule=schedule,
+                    context_mode=context_mode, enabled=enabled,
+                    delete_after_run=(schedule.kind == "at") if schedule else None,
+                    **fields,
+                )
+                if isinstance(result, str):
+                    return ToolResult.error(f"Error: job {result}: {job_id}")
+                return f"Updated job '{result.name}' (id: {result.id})"
+            return self._add_job(
+                name, message or "", every_seconds, cron_expr, tz, at,
+                context_mode=context_mode or "conversation",
+                context_session_key=context_session_key, output_session_key=output_session_key,
+            )
+        except (ValueError, TypeError, OverflowError, KeyError) as exc:
+            return ToolResult.error(f"Error: {exc}")
 
     def _add_job(
-        self,
-        name: str | None,
-        message: str,
-        every_seconds: int | None,
-        cron_expr: str | None,
-        tz: str | None,
-        at: str | None,
+        self, name: str | None, message: str, every_seconds: int | None,
+        cron_expr: str | None, tz: str | None, at: str | None, *,
+        context_mode: Literal["conversation", "last_active", "task", "none"] = "conversation",
+        context_session_key: str | None = None, output_session_key: str | None = None,
     ) -> str:
-        if not message:
-            return ToolResult.error(
-                "Error: cron action='add' requires a non-empty 'message' parameter "
-                "describing what to do when the job triggers "
-                "(e.g. the reminder text). Retry including message=\"...\"."
+        try:
+            if not message.strip():
+                raise ValueError("cron action='add' requires a non-empty 'message'. Retry including message=\"...\"")
+            schedule = self._schedule(every_seconds, cron_expr, tz, at, required=True)
+            assert schedule is not None
+            session_key, channel, chat_id, metadata = self._request_route()
+            if not session_key or not channel or not chat_id:
+                raise ValueError("scheduled cron jobs must be created from a chat session")
+            self._validate_targets(context_session_key, output_session_key)
+            job = self._cron.add_job(
+                name=name or message[:30], schedule=schedule, message=message,
+                delete_after_run=schedule.kind == "at", session_key=session_key,
+                origin_channel=channel, origin_chat_id=chat_id, origin_metadata=metadata,
+                context_mode=context_mode, context_session_key=context_session_key,
+                output_session_key=output_session_key,
             )
-        session_key, origin_channel, origin_chat_id, origin_metadata = self._request_route()
-        if not session_key:
-            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
-        if not origin_channel or not origin_chat_id:
-            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
-        if tz and not cron_expr:
-            return ToolResult.error("Error: tz can only be used with cron_expr")
-        if tz:
-            if err := self._validate_timezone(tz):
-                return err
+            return f"Created job '{job.name}' (id: {job.id})"
+        except (ValueError, TypeError, OverflowError, KeyError) as exc:
+            return ToolResult.error(f"Error: {exc}")
 
-        # Build schedule
-        delete_after = False
-        if every_seconds:
-            schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
-        elif cron_expr:
-            effective_tz = tz or self._default_timezone
-            if err := self._validate_timezone(effective_tz):
-                return err
-            schedule = CronSchedule(kind="cron", expr=cron_expr, tz=effective_tz)
-        elif at:
-            from zoneinfo import ZoneInfo
+    def _validate_targets(self, context_key: str | None, output_key: str | None) -> None:
+        if self._sessions is None:
+            return
+        from nanobot.session.delivery import resolve_session_target
 
-            try:
-                dt = datetime.fromisoformat(at)
-            except ValueError:
-                return ToolResult.error(f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS")
-            if dt.tzinfo is None:
-                if err := self._validate_timezone(self._default_timezone):
-                    return err
-                dt = dt.replace(tzinfo=ZoneInfo(self._default_timezone))
-            at_ms = int(dt.timestamp() * 1000)
-            schedule = CronSchedule(kind="at", at_ms=at_ms)
-            delete_after = True
-        else:
-            return ToolResult.error("Error: either every_seconds, cron_expr, or at is required")
-
-        job = self._cron.add_job(
-            name=name or message[:30],
-            schedule=schedule,
-            message=message,
-            delete_after_run=delete_after,
-            session_key=session_key,
-            origin_channel=origin_channel,
-            origin_chat_id=origin_chat_id,
-            origin_metadata=origin_metadata,
-        )
-        return f"Created job '{job.name}' (id: {job.id})"
+        for key in (context_key, output_key):
+            if key is None or key == "last_active" and key == output_key:
+                continue
+            resolve_session_target(self._sessions, key)
 
     def _format_timing(self, schedule: CronSchedule) -> str:
         """Format schedule as a human-readable timing string."""
@@ -259,7 +314,7 @@ class CronTool(Tool):
         return "System-managed internal job."
 
     def _list_jobs(self) -> str:
-        jobs = self._cron.list_jobs()
+        jobs = self._cron.list_jobs(include_disabled=True)
         if not jobs:
             return "No scheduled jobs."
         lines: list[str] = []
@@ -269,6 +324,11 @@ class CronTool(Tool):
             if j.payload.kind == "system_event":
                 parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                 parts.append("  Protected: visible for inspection, but cannot be removed.")
+            if j.payload.kind == "agent_turn":
+                parts.append(f"  Enabled: {j.enabled}; context: {j.payload.context_mode}; "
+                             f"history session: {j.payload.context_session_key or j.payload.session_key or 'dynamic'}; "
+                             f"message destination: {j.payload.output_session_key or j.payload.session_key}")
+                parts.append(f"  Instructions: {j.payload.message}")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)

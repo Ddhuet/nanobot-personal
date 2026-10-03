@@ -65,6 +65,8 @@ def cron_run_id(metadata: Mapping[str, Any] | None) -> str | None:
 def is_bound_cron_job(job: CronJob) -> bool:
     """True for session-bound cron jobs with complete delivery context."""
     payload = job.payload
+    if payload.kind == "agent_turn" and payload.output_session_key == "last_active":
+        return True
     if (
         payload.kind != "agent_turn"
         or not payload.session_key
