@@ -549,7 +549,10 @@ class MemoryStore:
         memory/MEMORY.md) reach Dream through the normal agent system context.
         """
         last_cursor = self.get_last_dream_cursor()
-        entries = self.read_unprocessed_history(since_cursor=last_cursor)
+        entries = [
+            entry for entry in self.read_unprocessed_history(since_cursor=last_cursor)
+            if entry["content"].strip()
+        ]
         if not entries:
             return None
 

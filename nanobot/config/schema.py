@@ -154,6 +154,7 @@ class AgentDefaults(Base):
         default=60,
         ge=0,
     )  # Minimum interval in seconds between scans for idle sessions
+    idle_compact_min_messages: int = Field(default=20, ge=1)  # New chat messages required
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
     @model_validator(mode="before")

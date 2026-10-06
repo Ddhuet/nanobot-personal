@@ -25,6 +25,21 @@ class TestBuildDreamPrompt:
     def test_returns_none_when_no_history(self, store):
         assert store.build_dream_prompt() is None
 
+    def test_returns_none_when_history_has_only_empty_entries(self, store):
+        store.append_history("")
+        store.append_history("   \n")
+        assert store.build_dream_prompt() is None
+        assert store.get_last_dream_cursor() == 0
+
+    def test_empty_entries_do_not_use_dream_batch_capacity(self, store):
+        store.append_history("")
+        cursor = store.append_history("useful summary")
+        result = store.build_dream_prompt(max_entries=1)
+        assert result is not None
+        prompt, last_cursor = result
+        assert "useful summary" in prompt
+        assert last_cursor == cursor
+
     def test_returns_prompt_with_history(self, store):
         store.append_history("hello")
         result = store.build_dream_prompt()

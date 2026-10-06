@@ -28,10 +28,12 @@ class AutoCompact:
 
     def __init__(self, sessions: SessionManager, consolidator: Consolidator,
                  session_ttl_minutes: int = 0,
-                 bind_events: SessionEventFactory | None = None):
+                 bind_events: SessionEventFactory | None = None,
+                 min_messages: int = 20):
         self.sessions = sessions
         self.consolidator = consolidator
         self._ttl = session_ttl_minutes
+        self._min_messages = min_messages
         self._archiving: set[str] = set()
         self._summaries: dict[str, SessionSummary] = {}
         self._bind_events = bind_events
@@ -54,12 +56,17 @@ class AutoCompact:
             return False
         return idle_seconds >= self._ttl * 60
 
-    def _has_unarchived_messages(self, key: str) -> bool:
+    def _has_enough_unarchived_messages(self, key: str) -> bool:
         session = self.sessions.get_or_create(key)
-        return any(
-            not message.get("_command") and not is_summary_checkpoint(message)
+        # Count new chat messages, not tool traffic or previous checkpoints.
+        return sum(
+            message.get("role") in {"user", "assistant"}
+            and bool(message.get("content"))
+            and not message.get("tool_calls")
+            and not message.get("_command")
+            and not is_summary_checkpoint(message)
             for message in session.messages[session.last_archived:]
-        )
+        ) >= self._min_messages
 
     @classmethod
     def _is_internal_session(cls, key: str) -> bool:
@@ -80,7 +87,7 @@ class AutoCompact:
             if key in active_session_keys:
                 continue
             updated_at = info.get("updated_at")
-            if self._is_expired(updated_at, now) and self._has_unarchived_messages(key):
+            if self._is_expired(updated_at, now) and self._has_enough_unarchived_messages(key):
                 session = self.sessions.get_or_create(key)
                 try:
                     runtime = resolve_runtime(session)

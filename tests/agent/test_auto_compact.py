@@ -21,6 +21,7 @@ from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT
 def _make_loop(
     tmp_path: Path,
     session_ttl_minutes: int = 15,
+    idle_compact_min_messages: int = 1,
 ) -> AgentLoop:
     """Create a minimal AgentLoop for testing."""
     bus = MessageBus()
@@ -36,6 +37,7 @@ def _make_loop(
         model="test-model",
         context_window_tokens=128_000,
         session_ttl_minutes=session_ttl_minutes,
+        idle_compact_min_messages=idle_compact_min_messages,
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
     return loop
@@ -173,6 +175,18 @@ class TestSessionTTLConfig:
         defaults = AgentDefaults()
         assert defaults.idle_compact_check_interval_seconds == 60
 
+    def test_idle_message_minimum_defaults_to_twenty(self):
+        assert AgentDefaults().idle_compact_min_messages == 20
+
+    def test_idle_message_minimum_uses_camel_case_config_key(self):
+        defaults = AgentDefaults.model_validate({"idleCompactMinMessages": 30})
+        assert defaults.idle_compact_min_messages == 30
+        assert defaults.model_dump(by_alias=True)["idleCompactMinMessages"] == 30
+
+    def test_idle_message_minimum_rejects_zero(self):
+        with pytest.raises(ValueError):
+            AgentDefaults.model_validate({"idleCompactMinMessages": 0})
+
     def test_idle_scan_interval_uses_camel_case_config_key(self):
         """The JSON config should use the standard camelCase alias."""
         defaults = AgentDefaults.model_validate({"idleCompactCheckIntervalSeconds": 10})
@@ -192,6 +206,7 @@ class TestIdleScanThrottling:
                 "defaults": {
                     "workspace": str(tmp_path),
                     "idleCompactCheckIntervalSeconds": 10,
+                    "idleCompactMinMessages": 30,
                 }
             }
         })
@@ -202,6 +217,7 @@ class TestIdleScanThrottling:
             tool_registry=ToolRegistry(),
             provider=provider,
         )
+        assert loop.auto_compact._min_messages == 30
         loop.auto_compact.check_expired = MagicMock()
 
         loop._check_expired_sessions_if_due()

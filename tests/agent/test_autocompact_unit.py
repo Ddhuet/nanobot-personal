@@ -8,6 +8,7 @@ import pytest
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.events import NO_EVENTS, ContextCompactionEvent, EventSink
 from nanobot.session.manager import Session, SessionManager
+from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT
 
 
 def _runtime(_session: Session | None = None):
@@ -37,6 +38,7 @@ def _make_autocompact(
     ttl: int = 15,
     sessions: SessionManager | None = None,
     consolidator: MagicMock | None = None,
+    min_messages: int = 1,
 ) -> AutoCompact:
     """Create an AutoCompact with mock dependencies."""
     if sessions is None:
@@ -48,6 +50,7 @@ def _make_autocompact(
         sessions=sessions,
         consolidator=consolidator,
         session_ttl_minutes=ttl,
+        min_messages=min_messages,
     )
 
 
@@ -379,8 +382,8 @@ class TestCheckExpired:
         scheduler.assert_not_called()
         assert "dream:20260602-155256" not in ac._archiving
 
-    def test_short_unarchived_session_schedules(self):
-        """A short idle session still needs an archive entry for Dream."""
+    def test_short_unarchived_session_schedules_with_lower_configured_minimum(self):
+        """An explicitly lowered minimum can still archive a short session."""
         ac = _make_autocompact(ttl=15)
         mock_sm = MagicMock(spec=SessionManager)
         last_active = datetime(2026, 1, 1, 10, 0, 0)
@@ -402,6 +405,40 @@ class TestCheckExpired:
 
         assert len(scheduled) == 1
         assert ac._archiving == {"cli:short"}
+
+    @pytest.mark.parametrize("count", [0, 1, 19, 20, 21])
+    @pytest.mark.parametrize("expired", [False, True])
+    def test_default_requires_twenty_new_chat_messages_and_inactivity(self, count, expired):
+        sessions = MagicMock(spec=SessionManager)
+        ac = AutoCompact(sessions, MagicMock(), session_ttl_minutes=15)
+        session = _make_session()
+        _add_turns(session, 15, prefix="already archived")
+        session.last_archived = len(session.messages)
+        for i in range(count):
+            session.add_message("user" if i % 2 == 0 else "assistant", f"chat {i}")
+        # These records must never push a short conversation over the minimum.
+        for _ in range(25):
+            session.add_message("tool", "tool result")
+            session.add_message("assistant", "", tool_calls=[{"id": "call"}])
+            session.add_message("assistant", "tool progress", tool_calls=[{"id": "call"}])
+            session.add_message("assistant", "")
+            session.add_message("user", "/status", _command=True)
+            session.add_message("user", SUMMARY_CONTINUATION_TEXT, _hidden_history=True)
+        age = 20 if expired else 5
+        session.updated_at = datetime.now() - timedelta(minutes=age)
+        sessions.list_sessions.return_value = [
+            {"key": session.key, "updated_at": session.updated_at.isoformat()}
+        ]
+        sessions.get_or_create.return_value = session
+        scheduled = []
+
+        def scheduler(coro):
+            scheduled.append(coro)
+            coro.close()
+
+        ac.check_expired(scheduler, _runtime)
+
+        assert len(scheduled) == int(expired and count >= 20)
 
     def test_fully_archived_session_skips(self):
         ac = _make_autocompact(ttl=15)

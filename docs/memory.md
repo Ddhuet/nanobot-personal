@@ -45,6 +45,15 @@ Each line is a JSON object:
 
 It is not the final memory. It is the material from which final memory is shaped.
 
+Automatic idle compaction requires both the configured inactivity period
+(`agents.defaults.idleCompactAfterMinutes`, default 15 minutes) and at least
+`agents.defaults.idleCompactMinMessages` new chat messages (default 20).
+User messages and assistant replies count; tool calls/results, commands, empty
+messages, and summary checkpoints do not. Archived messages do not count toward
+the next batch. Manual and context-limit compaction retain their existing behavior.
+Dream checks for archived summaries every two hours by default; that schedule is
+independent of conversation inactivity. Empty archive entries do not start Dream.
+
 ### Stage 2: Dream
 
 `Dream` is the slower, more thoughtful layer. It runs on a cron schedule by default and can also be triggered manually.
