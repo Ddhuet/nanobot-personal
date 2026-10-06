@@ -65,7 +65,9 @@ _CRON_PARAMETERS = tool_parameters_schema(
     required=["action"],
     description=(
         "Action-specific parameters: add requires a non-empty message plus one schedule "
-        "(every_seconds, cron_expr, or at); remove requires job_id; list only needs action. "
+        "(every_seconds, cron_expr, or at); update requires job_id and accepts exactly one "
+        "schedule to replace it, or no schedule to keep it unchanged; "
+        "remove requires job_id; list only needs action. "
         "Per-action requirements are enforced at runtime (see field descriptions) so the "
         "top-level schema stays compatible with providers (e.g. OpenAI Codex/Responses) that "
         "reject oneOf/anyOf/allOf/enum/not at the root of function parameters."

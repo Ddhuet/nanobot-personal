@@ -16,6 +16,9 @@ import pytest
 from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.cron.service import CronService
+from nanobot.cron.types import CronSchedule
+from nanobot.providers.openai_responses.converters import convert_tools
 
 
 class _SvcStub:
@@ -52,6 +55,47 @@ def registry() -> Iterator[ToolRegistry]:
 
 
 class TestSchemaContract:
+    def test_responses_keeps_schedule_fields_optional(self, registry: ToolRegistry) -> None:
+        wire_tool = convert_tools(registry.get_definitions())[0]
+        assert wire_tool["strict"] is False
+        assert wire_tool["parameters"]["required"] == ["action"]
+        _, _, err = registry.prepare_call(
+            "cron", {"action": "update", "job_id": "abc", "at": "2030-01-01T00:00:00"}
+        )
+        assert err is None
+
+    @pytest.mark.asyncio
+    async def test_expired_one_off_can_be_rescheduled_with_only_at(self, tmp_path, monkeypatch):
+        from datetime import datetime, timezone
+
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now_ms - 120_000)
+        service = CronService(tmp_path / "jobs.json")
+        job = service.add_job(
+            name="reminder", message="Original reminder",
+            schedule=CronSchedule(kind="at", at_ms=now_ms - 60_000),
+            session_key="discord:test", origin_channel="discord", origin_chat_id="test",
+            delete_after_run=True,
+        )
+        monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now_ms)
+        registry = ToolRegistry()
+        registry.register(CronTool(service))
+
+        result = await registry.execute("cron", {
+            "action": "update", "job_id": job.id, "at": "2030-01-02T15:00:00-07:00",
+        })
+
+        assert "Updated job" in result
+        saved = CronService(service.store_path).get_job(job.id)
+        assert saved is not None
+        expected = int(datetime.fromisoformat("2030-01-02T15:00:00-07:00").timestamp() * 1000)
+        assert saved.schedule.kind == "at"
+        assert saved.schedule.at_ms == saved.state.next_run_at_ms == expected
+        assert saved.schedule.every_ms is None
+        assert saved.payload.message == "Original reminder"
+        assert saved.delete_after_run
+
     def test_list_accepted_without_message(self, registry: ToolRegistry) -> None:
         # action='list' must pass schema validation with nothing but 'action'.
         _, _, err = registry.prepare_call("cron", {"action": "list"})

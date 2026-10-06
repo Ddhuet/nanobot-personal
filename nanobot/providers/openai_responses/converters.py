@@ -188,6 +188,9 @@ def convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "name": name,
             "description": fn.get("description") or "",
             "parameters": params if isinstance(params, dict) else {},
+            # Responses may otherwise normalize optional fields into required ones.
+            # Keep the tool's contract unless it explicitly opts into strict mode.
+            "strict": fn.get("strict") is True,
         })
     return converted
 

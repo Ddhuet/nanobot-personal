@@ -381,7 +381,18 @@ class TestConvertTools:
         assert result[0]["type"] == "function"
         assert result[0]["name"] == "get_weather"
         assert result[0]["description"] == "Get weather"
+        assert result[0]["strict"] is False
         assert "properties" in result[0]["parameters"]
+
+    @pytest.mark.parametrize("strict", [True, False, None])
+    @pytest.mark.parametrize("wrapped", [True, False])
+    def test_explicit_strict_mode_is_preserved(self, strict, wrapped):
+        function = {"name": "f", "parameters": {}, "strict": strict}
+        tool = {"type": "function", "function": function} if wrapped else function
+
+        result = convert_tools([tool])
+
+        assert result[0]["strict"] is (strict is True)
 
     def test_tool_without_name_skipped(self):
         tools = [{"type": "function", "function": {"parameters": {}}}]
