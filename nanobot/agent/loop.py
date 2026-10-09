@@ -1895,7 +1895,9 @@ class AgentLoop:
         history_key = ctx.msg.metadata.get("_cron_history_session")
         if isinstance(history_key, str):
             source = self.sessions.get_or_create(history_key)
-            ctx.history = source.get_history(include_timestamps=True)
+            # The cron run only needs the dialogue; the source session's tool
+            # calls belong to other turns and confuse the scheduled agent.
+            ctx.history = source.get_history(include_timestamps=True, include_tool_calls=False)
             from nanobot.session.summary import session_summary_from_metadata
 
             ctx.pending_summary = session_summary_from_metadata(

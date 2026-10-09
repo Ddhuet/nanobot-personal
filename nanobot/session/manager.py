@@ -350,12 +350,16 @@ class Session:
         extend_to_user: bool = False,
         include_runtime_context: bool = True,
         include_timestamps: bool = False,
+        include_tool_calls: bool = True,
     ) -> list[dict[str, Any]]:
         """Return recent replayable messages for LLM input.
 
         A committed summary checkpoint replaces its old prefix with the stored
         summary and resumes replay at a hidden continuation marker. A positive
         ``max_messages`` applies an additional caller-owned count limit.
+        ``include_tool_calls=False`` returns only the user/assistant dialogue:
+        tool results, tool-call requests, and reasoning are dropped so another
+        agent (e.g. a cron run) does not mistake them for its own work.
         """
         replayable = self.messages[self.last_archived:]
         if max_messages <= 0:
@@ -386,6 +390,8 @@ class Session:
         out: list[dict[str, Any]] = []
         for message in sliced:
             if message.get("_command"):
+                continue
+            if not include_tool_calls and message.get("role") == "tool":
                 continue
             has_persisted_runtime_context = isinstance(
                 message.get(RUNTIME_CONTEXT_HISTORY_META),
@@ -435,12 +441,15 @@ class Session:
                     breadcrumbs = "\n".join(cli_lines)
                     content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
             if role == "assistant" and isinstance(content, str) and not content.strip():
-                if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
+                if not include_tool_calls or not any(
+                    key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")
+                ):
                     continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
-                if key in message:
-                    entry[key] = message[key]
+            if include_tool_calls:
+                for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
+                    if key in message:
+                        entry[key] = message[key]
             if include_timestamps and "timestamp" in message and not message.get("_hidden_history"):
                 entry["timestamp"] = message["timestamp"]
             out.append(entry)

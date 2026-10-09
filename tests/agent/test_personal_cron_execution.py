@@ -88,6 +88,32 @@ async def test_latest_history_is_read_after_waiting_and_output_is_independent(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["conversation", "last_active"])
+async def test_cron_history_excludes_source_session_tool_calls(tmp_path, mode):
+    loop, cron = make_loop(tmp_path, [LLMResponse(content="internal")])
+    source = chat(loop, "discord:dm", "What's the weather today?")
+    source.add_message("assistant", "", tool_calls=[{
+        "id": "call_1", "type": "function",
+        "function": {"name": "web_search", "arguments": '{"query": "weather-lookup-arg"}'},
+    }], reasoning_content="need to look it up")
+    source.add_message("tool", "too damn hot", tool_call_id="call_1", name="web_search")
+    source.add_message("assistant", "It's going to be hot today.")
+    loop.sessions.save(source)
+    await run_cron_job(job(mode), agent=loop, cron=cron,
+                       last_active=lambda: resolve_session_target(loop.sessions, "discord:dm"))
+    messages = loop.provider.chat_stream_with_retry.await_args.kwargs["messages"]
+    prompt = str(messages)
+    assert "What's the weather today?" in prompt
+    assert "It's going to be hot today." in prompt
+    assert "too damn hot" not in prompt
+    assert "weather-lookup-arg" not in prompt
+    assert "need to look it up" not in prompt
+    assert all(m.get("role") != "tool" and not m.get("tool_calls") for m in messages)
+    # The source session itself keeps its full tool history.
+    assert any(m.get("role") == "tool" for m in source.messages)
+
+
+@pytest.mark.asyncio
 async def test_explicit_cron_message_is_recorded_once_in_destination_thread(tmp_path):
     responses = [
         LLMResponse(content="internal thinking", tool_calls=[ToolCallRequest(
