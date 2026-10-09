@@ -879,7 +879,12 @@ class ExecTool(Tool):
                             + _WORKSPACE_BOUNDARY_NOTE
                         )
                     else:
-                        p = Path(expanded).expanduser().resolve()
+                        # Anchor relative leftovers to the command cwd, not the
+                        # gateway process cwd.
+                        p = Path(expanded).expanduser()
+                        if not p.is_absolute():
+                            p = cwd_path / p
+                        p = p.resolve()
                     # Match against the un-resolved path first.  On Linux,
                     # /dev/stderr is a symlink to /proc/self/fd/2 and
                     # ``Path.resolve()`` would mask the device-file intent.
@@ -999,8 +1004,11 @@ class ExecTool(Tool):
     def _extract_absolute_paths(command: str) -> list[str]:
         # Windows: match drive-root paths like `C:\` as well as `C:\path\to\file`, and UNC paths like `\\server\share`
         # NOTE: `*` is required so `C:\` (nothing after the slash) is still extracted.
+        # Off Windows a drive letter must be followed by a separator; otherwise
+        # strftime formats such as `date +%H:%M` would be misread as `H:%M`.
+        drive = r"[A-Za-z]:" if _IS_WINDOWS else r"[A-Za-z]:[\\/]"
         win_paths = re.findall(
-            r"(?<![A-Za-z])(?:[A-Za-z]:[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
+            rf"(?<![A-Za-z])(?:{drive}[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
             command
         )
         try:

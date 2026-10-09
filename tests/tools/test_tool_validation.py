@@ -343,6 +343,14 @@ def test_exec_guard_blocks_home_path_outside_workspace(tmp_path) -> None:
     assert "hard policy boundary" in error
 
 
+def test_exec_guard_allows_strftime_time_format(tmp_path) -> None:
+    """`%H:%M` must not be mistaken for a Windows drive path like `H:`."""
+    tool = ExecTool(restrict_to_workspace=True)
+    cmd = "date '+%Y-%m-%d %H:%M %Z (%A)'"
+    assert ExecTool._extract_absolute_paths(cmd) == []
+    assert tool._guard_command(cmd, str(tmp_path)) is None
+
+
 def test_exec_guard_blocks_bare_tilde_cwd_escape(tmp_path) -> None:
     tool = ExecTool(restrict_to_workspace=True)
     error = tool._guard_command("cd ~ && cat secret.txt", str(tmp_path))
