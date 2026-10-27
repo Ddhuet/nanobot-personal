@@ -36,19 +36,6 @@ def _populated_session(turns: int) -> Session:
     return session
 
 
-def _tool_round(call_id: str) -> list[dict]:
-    return [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": call_id, "type": "function", "function": {"name": "x", "arguments": "{}"}}
-            ],
-        },
-        {"role": "tool", "tool_call_id": call_id, "name": "x", "content": "ok"},
-    ]
-
-
 def test_default_history_has_no_message_count_limit() -> None:
     session = _populated_session(1_001)
 
@@ -81,7 +68,9 @@ async def test_process_message_hands_complete_replay_to_runner(tmp_path: Path) -
         )
 
     assert result is not None
-    assert get_history.call_args.kwargs == {"extend_to_user": False, "include_timestamps": True}
+    assert get_history.call_args.kwargs == {
+        "extend_to_user": False, "include_timestamps": True, "include_tool_calls": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -96,8 +85,9 @@ async def test_runner_checkpoint_keeps_current_user_as_replay_boundary(tmp_path:
     session.add_message("user", "old")
     session.add_message("assistant", "old answer")
     session.add_message("user", "long older turn")
-    for index in range(70):
-        session.messages.extend(_tool_round(f"older-{index}"))
+    # Finished turns replay without tool calls, so the bulk must be dialogue.
+    for index in range(40):
+        session.add_message("assistant", f"older-{index} " + "padding " * 15)
     session.add_message("assistant", "older final")
 
     result = await loop._process_message(

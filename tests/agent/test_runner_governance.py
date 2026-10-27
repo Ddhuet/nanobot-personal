@@ -1361,8 +1361,8 @@ async def test_runner_drops_orphan_tool_results_before_model_request():
 
 
 @pytest.mark.asyncio
-async def test_backfill_repairs_model_context_without_shifting_save_turn_boundary(tmp_path):
-    """Historical backfill should not duplicate old tail messages on persist."""
+async def test_unanswered_historical_tool_call_is_not_replayed_or_duplicated(tmp_path):
+    """Finished turns replay without tool calls; persisting must not duplicate the old tail."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import InboundMessage
     from nanobot.bus.queue import MessageBus
@@ -1407,13 +1407,11 @@ async def test_backfill_repairs_model_context_without_shifting_save_turn_boundar
     assert result.content == "new answer"
 
     request_messages = provider.chat_stream_with_retry.await_args.kwargs["messages"]
-    synthetic = [
-        message
+    assert all(
+        message.get("role") != "tool" and not message.get("tool_calls")
         for message in request_messages
-        if message.get("role") == "tool" and message.get("tool_call_id") == "call_missing"
-    ]
-    assert len(synthetic) == 1
-    assert synthetic[0]["content"] == BACKFILL_CONTENT
+    )
+    assert "old tail" in str(request_messages)
 
     session_after = loop.sessions.get_or_create("cli:test")
     assert [

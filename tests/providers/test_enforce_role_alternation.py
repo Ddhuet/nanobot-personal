@@ -49,7 +49,7 @@ class TestEnforceRoleAlternation:
         assert "Hello" in result[0]["content"]
         assert "How are you?" in result[0]["content"]
 
-    def test_consecutive_assistant_messages_merged(self):
+    def test_consecutive_assistant_replies_stay_separate(self):
         msgs = [
             {"role": "user", "content": "Hi"},
             {"role": "assistant", "content": "Hello!"},
@@ -57,9 +57,7 @@ class TestEnforceRoleAlternation:
             {"role": "user", "content": "Thanks"},
         ]
         result = LLMProvider._enforce_role_alternation(msgs)
-        assert len(result) == 3
-        assert "Hello!" in result[1]["content"]
-        assert "How can I help?" in result[1]["content"]
+        assert [m["content"] for m in result] == ["Hi", "Hello!", "How can I help?", "Thanks"]
 
     def test_system_messages_not_merged(self):
         msgs = [

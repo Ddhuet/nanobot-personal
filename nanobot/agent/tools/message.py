@@ -165,9 +165,9 @@ class MessageTool(Tool):
         buttons: Any = None,
         **kwargs: Any,
     ) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]
-        from nanobot.utils.helpers import strip_leading_timestamp, strip_think
+        from nanobot.utils.helpers import strip_history_timestamps, strip_think
 
-        content = strip_leading_timestamp(strip_think(content)) or ""
+        content = strip_history_timestamps(strip_think(content)) or ""
 
         button_rows: list[list[str]] | None = None
         if buttons is not None:

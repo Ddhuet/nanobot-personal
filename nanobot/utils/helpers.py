@@ -165,21 +165,24 @@ _THINKING_TAG_PREFIX = "|".join(
 _PARTIAL_THINKING_TAG = rf"</?(?:{_THINKING_TAG_PREFIX})>?"
 
 
-_LEADING_TIMESTAMP_RE = re.compile(
-    r"^[\s\u200b\ufeff]*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*"
-)
+HISTORY_TIMESTAMP_TEMPLATE = "[0000-00-00 00:00]"
+_HISTORY_TIMESTAMP = r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]"
+_LEADING_TIMESTAMP_RE = re.compile(rf"^[\s\u200b\ufeff]*{_HISTORY_TIMESTAMP}\s*")
+_INLINE_TIMESTAMP_RE = re.compile(rf"[\u200b\ufeff]*{_HISTORY_TIMESTAMP}[ \t]*")
 
 
-def strip_leading_timestamp(text: str | None) -> str | None:
-    """Remove an accidental leading message-history timestamp from model output.
+def strip_history_timestamps(text: str | None) -> str | None:
+    """Remove copied message-history timestamp labels anywhere in model output.
 
-    Models sometimes put a newline, a zero-width space, or a byte-order mark
-    before the copied label.  Chat clients do not make those characters
-    visible, so tolerate them while still requiring the exact history label.
+    History replay prefixes each message with ``[YYYY-MM-DD HH:MM]``. Models
+    imitate that label at the start of a reply and also mid-reply, where it
+    introduces invented follow-up "messages". Only the exact label format is
+    removed. A leading label also takes surrounding whitespace, zero-width
+    spaces, and byte-order marks with it, since chat clients hide those.
     """
     if not text:
         return text
-    return _LEADING_TIMESTAMP_RE.sub("", text)
+    return _INLINE_TIMESTAMP_RE.sub("", _LEADING_TIMESTAMP_RE.sub("", text))
 
 
 def format_message_timestamp(ts: str, timezone: str | None = None) -> str:

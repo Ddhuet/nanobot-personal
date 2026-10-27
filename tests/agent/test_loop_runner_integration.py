@@ -247,10 +247,10 @@ async def test_runtime_context_is_persisted_as_next_turn_prompt_prefix(tmp_path)
     second_request = provider.chat_stream_with_retry.await_args_list[1].kwargs["messages"]
     first_wire = LLMProvider._sanitize_empty_content(first_request)
     second_wire = LLMProvider._sanitize_empty_content(second_request)
-    from nanobot.utils.helpers import strip_leading_timestamp
+    from nanobot.utils.helpers import strip_history_timestamps
 
     normalized_prefix = [
-        {**message, "content": strip_leading_timestamp(message["content"])}
+        {**message, "content": strip_history_timestamps(message["content"])}
         if isinstance(message.get("content"), str) else message
         for message in second_wire[:len(first_wire)]
     ]
@@ -259,7 +259,7 @@ async def test_runtime_context_is_persisted_as_next_turn_prompt_prefix(tmp_path)
     assert "Follow the unique review checklist." not in first_wire[0]["content"]
     assert "Follow the unique review checklist." in first_wire[1]["content"]
     assert second_wire[2]["role"] == "assistant"
-    assert strip_leading_timestamp(second_wire[2]["content"]) == "first answer"
+    assert strip_history_timestamps(second_wire[2]["content"]) == "first answer"
     assert second_wire[3]["content"].startswith("second turn")
     assert len(provider_calls) == 2
 

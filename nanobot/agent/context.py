@@ -32,7 +32,7 @@ from nanobot.utils.helpers import (
     detect_image_mime,
     format_message_timestamp,
     load_bundled_template,
-    strip_leading_timestamp,
+    strip_history_timestamps,
 )
 from nanobot.utils.prompt_templates import render_template
 
@@ -320,7 +320,7 @@ class ContextBuilder:
                 label = format_message_timestamp(original["timestamp"], self.timezone)
                 content = original.get("content", "")
                 if isinstance(content, str):
-                    clean = strip_leading_timestamp(content) or ""
+                    clean = strip_history_timestamps(content) or ""
                     message["content"] = f"{label} {clean}" if clean else label
                 elif isinstance(content, list):
                     message["content"] = [{"type": "text", "text": label}, *content]

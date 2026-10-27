@@ -1891,7 +1891,14 @@ class AgentLoop:
             session = ctx.require_session()
         is_subagent = ctx.kind is TurnKind.SYSTEM and ctx.msg.sender_id == "subagent"
 
-        ctx.history = session.get_history(extend_to_user=is_subagent, include_timestamps=True)
+        # Tool calls only matter inside the turn that made them (the runner keeps
+        # them in memory). Finished turns replay as dialogue; an internal goal
+        # continuation is the same response, so it keeps its earlier tool work.
+        ctx.history = session.get_history(
+            extend_to_user=is_subagent,
+            include_timestamps=True,
+            include_tool_calls=turn_continuation.internal_continuation_inbound(ctx.msg.metadata),
+        )
         history_key = ctx.msg.metadata.get("_cron_history_session")
         if isinstance(history_key, str):
             source = self.sessions.get_or_create(history_key)
@@ -2266,14 +2273,14 @@ class AgentLoop:
                 if isinstance(runtime_context_meta, dict):
                     entry[RUNTIME_CONTEXT_HISTORY_META] = runtime_context_meta
             if role == "assistant":
-                from nanobot.utils.helpers import strip_leading_timestamp
+                from nanobot.utils.helpers import strip_history_timestamps
 
                 assistant_content = entry.get("content")
                 assistant_reasoning = entry.get("reasoning_content")
                 if isinstance(assistant_content, str):
-                    entry["content"] = strip_leading_timestamp(assistant_content)
+                    entry["content"] = strip_history_timestamps(assistant_content)
                 if isinstance(assistant_reasoning, str):
-                    entry["reasoning_content"] = strip_leading_timestamp(assistant_reasoning)
+                    entry["reasoning_content"] = strip_history_timestamps(assistant_reasoning)
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
             if role == "user":

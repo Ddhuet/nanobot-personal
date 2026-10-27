@@ -1122,11 +1122,12 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _enforce_role_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Merge consecutive same-role messages and drop trailing assistant messages.
+        """Merge consecutive user messages and drop trailing assistant messages.
 
         Some providers (OpenAI-compat, Azure, vLLM, Ollama, etc.) reject requests
         where the last message is 'assistant' (prefill not supported) or two
-        consecutive non-system messages share the same role.
+        consecutive non-system messages share the same role. Consecutive
+        plain-text assistant replies are kept as separate messages.
         """
         if not messages:
             return messages
@@ -1150,6 +1151,11 @@ class LLMProvider(ABC):
                         continue
                     if prev_has_tools:
                         continue
+                    # Separate replies (e.g. unanswered check-ins sent hours
+                    # apart) stay separate messages; merging them teaches the
+                    # model that one reply holds several timestamped messages.
+                    merged.append(dict(msg))
+                    continue
                 prev_content = prev.get("content") or ""
                 curr_content = msg.get("content") or ""
                 if isinstance(prev_content, str) and isinstance(curr_content, str):

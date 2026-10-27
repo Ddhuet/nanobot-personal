@@ -11,7 +11,12 @@ from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.bus.outbound_events import ProgressEvent, StreamDeltaEvent, StreamEndEvent
 from nanobot.events import NO_EVENTS, EventSink
 from nanobot.providers.base import ToolCallRequest
-from nanobot.utils.helpers import IncrementalThinkExtractor, strip_leading_timestamp, strip_think
+from nanobot.utils.helpers import (
+    HISTORY_TIMESTAMP_TEMPLATE,
+    IncrementalThinkExtractor,
+    strip_history_timestamps,
+    strip_think,
+)
 from nanobot.utils.progress_events import (
     build_tool_event_finish_payloads,
     build_tool_event_start_payload,
@@ -48,22 +53,32 @@ class AgentProgressHook(AgentHook):
     def _strip_think(text: str | None) -> str | None:
         if not text:
             return None
-        return strip_leading_timestamp(strip_think(text)) or None
+        return strip_history_timestamps(strip_think(text)) or None
 
     def _tool_hint(self, tool_calls: list[Any]) -> str:
         return format_tool_hints(tool_calls, max_length=self._tool_hint_max_length)
 
     @staticmethod
     def _visible_prefix(text: str, *, final: bool = False) -> str:
-        """Hold a possible copied timestamp until its prefix can be classified."""
-        candidate = text.lstrip(" \t\r\n\u200b\ufeff")
-        pattern = "[0000-00-00 00:00]"
-        if not final and len(candidate) <= len(pattern) and all(
-            char in "0123456789" if expected == "0" else char == expected
-            for char, expected in zip(candidate, pattern)
-        ):
-            return ""
-        return strip_leading_timestamp(text) or ""
+        """Hold a possible copied timestamp until it can be classified.
+
+        Labels are stripped anywhere in the text, so an unfinished ``[`` that
+        could still become one is held back wherever it appears, together with
+        the invisible characters the strip would remove alongside it.
+        """
+        if not final:
+            start = text.rfind("[")
+            tail = text[start:] if start >= 0 else ""
+            if start >= 0 and len(tail) <= len(HISTORY_TIMESTAMP_TEMPLATE) and all(
+                char in "0123456789" if expected == "0" else char == expected
+                for char, expected in zip(tail, HISTORY_TIMESTAMP_TEMPLATE)
+            ):
+                text = text[:start]
+            text = text.rstrip("\u200b\ufeff")
+            # Whitespace alone may still precede a leading label.
+            if not text.strip(" \t\r\n\u200b\ufeff"):
+                return ""
+        return strip_history_timestamps(text) or ""
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         prev_clean = self._visible_prefix(strip_think(self._stream_buf))
